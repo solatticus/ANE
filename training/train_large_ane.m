@@ -16,8 +16,8 @@
 #include "ane_rmsnorm_bwd.h"
 #include "ane_classifier.h"
 
-#define CKPT_PATH "ane_stories110M_ckpt.bin"
-#define MODEL_PATH "../../assets/models/stories110M.bin"
+#define CKPT_PATH_DEFAULT "ane_stories110M_ckpt.bin"
+#define MODEL_PATH_DEFAULT "stories110M.bin"
 #define DATA_PATH "tinystories_data00.bin"
 
 // ===== Weight loading from llama2.c format =====
@@ -202,11 +202,25 @@ int main(int argc, char *argv[]) {
         float lr = 3e-4f;
         float adam_b1=0.9f, adam_b2=0.999f, adam_eps=1e-8f;
         int adam_t = 0, start_step = 0;
+        const char *ckpt_path = CKPT_PATH_DEFAULT;
+        const char *model_path = MODEL_PATH_DEFAULT;
         bool do_resume = false;
+        bool ane_extras = true;  // classifier, softmax, rmsnorm_bwd on ANE
+        int pos = 0;
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
+            else if (strcmp(argv[i], "--no-ane-extras") == 0) ane_extras = false;
             else if (strcmp(argv[i], "--steps") == 0 && i+1<argc) total_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) lr = atof(argv[++i]);
+            else if (strcmp(argv[i], "--ckpt") == 0 && i+1<argc) ckpt_path = argv[++i];
+            else if (strcmp(argv[i], "--model") == 0 && i+1<argc) model_path = argv[++i];
+            else if (argv[i][0] != '-') {
+                if (pos == 0) model_path = argv[i];
+                else if (pos == 1) { /* seq - compile-time constant */ }
+                else if (pos == 2) total_steps = atoi(argv[i]);
+                else if (pos == 3) lr = atof(argv[i]);
+                pos++;
+            }
         }
 
         LayerWeights lw[NLAYERS]; LayerAdam la[NLAYERS];
@@ -228,7 +242,7 @@ int main(int argc, char *argv[]) {
         float resume_loss = 0;
         bool resuming = false;
         if (do_resume) {
-            resuming = load_checkpoint(CKPT_PATH, &start_step, &total_steps, &lr, &resume_loss,
+            resuming = load_checkpoint(ckpt_path, &start_step, &total_steps, &lr, &resume_loss,
                 &cum_compile, &cum_train, &cum_wall, &cum_steps, &cum_batches, &adam_t,
                 lw, la, rms_final, &arms_final, embed, &aembed);
             if (resuming) printf("[RESUMED step %d, loss=%.4f]\n", start_step, resume_loss);
@@ -236,8 +250,9 @@ int main(int argc, char *argv[]) {
         if (!resuming) {
             printf("=== ANE Training: Stories110M (ANE-offloaded) ===\n");
             printf("dim=%d hidden=%d heads=%d seq=%d vocab=%d layers=%d\n", DIM, HIDDEN, HEADS, SEQ, VOCAB, NLAYERS);
-            printf("NEW: final_rmsnorm, classifier_fwd, softmax, rmsnorm_bwd on ANE\n");
-            if (!load_pretrained(lw, rms_final, embed, MODEL_PATH)) {
+            if (ane_extras) printf("NEW: final_rmsnorm, classifier_fwd, softmax, rmsnorm_bwd on ANE\n");
+            else printf("ANE extras DISABLED (classifier/softmax/rmsnorm_bwd on CPU)\n");
+            if (!load_pretrained(lw, rms_final, embed, model_path)) {
                 printf("Pretrained load failed, using random init\n");
                 srand48(42);
                 float scale_d=1.0f/sqrtf(DIM), scale_h=1.0f/sqrtf(HIDDEN);
@@ -301,9 +316,12 @@ int main(int argc, char *argv[]) {
         memset(rmsFFNBwd, 0, sizeof(rmsFFNBwd));
 
         // Softmax kernel (no weights — compile once)
-        Kern *softmaxKern = compile_softmax_kern();
-        if (!softmaxKern) { printf("softmax compile failed\n"); return 1; }
-        printf("Softmax kernel compiled (no weights)\n");
+        Kern *softmaxKern = NULL;
+        if (ane_extras) {
+            softmaxKern = compile_softmax_kern();
+            if (!softmaxKern) { printf("softmax compile failed\n"); return 1; }
+            printf("Softmax kernel compiled (no weights)\n");
+        }
 
         // Final RMSNorm and classifier are recompiled per batch since they have baked weights
         Kern *finalRmsKern = NULL, *classifierKern = NULL;
@@ -320,8 +338,8 @@ int main(int argc, char *argv[]) {
         int step = start_step;
         while (step < total_steps) {
             // Check compile budget — account for new kernels
-            // Per batch: 60 layer kernels + 24 rmsnorm_bwd + 1 classifier + 1 final_rms = 86
-            int kernels_needed = TOTAL_WEIGHT_KERNELS + 2*NLAYERS + 2;
+            // Per batch: 60 layer kernels [+ 24 rmsnorm_bwd + 1 classifier + 1 final_rms = 86 with extras]
+            int kernels_needed = TOTAL_WEIGHT_KERNELS + (ane_extras ? 2*NLAYERS + 2 : 0);
             if (g_compile_count + kernels_needed > MAX_COMPILES) {
                 for (int L=0; L<NLAYERS; L++) {
                     free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]);
@@ -329,13 +347,16 @@ int main(int argc, char *argv[]) {
                 }
                 free_kern(softmaxKern); free_kern(finalRmsKern); free_kern(classifierKern);
                 double wall = tb_ms(mach_absolute_time() - t_wall_start);
-                save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
+                save_checkpoint(ckpt_path, step, total_steps, lr, last_loss,
                     total_compile_ms+cum_compile, total_train_ms+cum_train, wall+cum_wall,
                     total_steps_done+cum_steps, total_batches+cum_batches, adam_t,
                     lw, la, rms_final, &arms_final, embed, &aembed);
                 printf("[exec() restart step %d, %d compiles, loss=%.4f]\n", step, g_compile_count, last_loss);
                 fflush(stdout);
-                execl(argv[0], argv[0], "--resume", NULL);
+                if (ane_extras)
+                    execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, NULL);
+                else
+                    execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, "--no-ane-extras", NULL);
                 perror("execl"); return 1;
             }
 
@@ -350,13 +371,15 @@ int main(int argc, char *argv[]) {
                     printf("\nCompile failed at layer %d\n", L);
                     compile_ok = false; break;
                 }
-                // NEW: Compile RMSNorm backward kernels for this layer
-                free_kern(rmsAttBwd[L]); free_kern(rmsFFNBwd[L]);
-                rmsAttBwd[L] = compile_rmsnorm_bwd_kern(lw[L].rms_att);
-                rmsFFNBwd[L] = compile_rmsnorm_bwd_kern(lw[L].rms_ffn);
-                if (!rmsAttBwd[L] || !rmsFFNBwd[L]) {
-                    printf("\nrmsnorm_bwd compile failed at layer %d\n", L);
-                    compile_ok = false; break;
+                // Compile RMSNorm backward kernels for this layer (if ane_extras)
+                if (ane_extras) {
+                    free_kern(rmsAttBwd[L]); free_kern(rmsFFNBwd[L]);
+                    rmsAttBwd[L] = compile_rmsnorm_bwd_kern(lw[L].rms_att);
+                    rmsFFNBwd[L] = compile_rmsnorm_bwd_kern(lw[L].rms_ffn);
+                    if (!rmsAttBwd[L] || !rmsFFNBwd[L]) {
+                        printf("\nrmsnorm_bwd compile failed at layer %d\n", L);
+                        compile_ok = false; break;
+                    }
                 }
             }
             if (!compile_ok) { g_compile_count = MAX_COMPILES; continue; }
@@ -369,18 +392,19 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // NEW: Compile final RMSNorm and classifier with current weights
-            free_kern(finalRmsKern); free_kern(classifierKern);
-            finalRmsKern = compile_final_rmsnorm_kern(rms_final);
-            classifierKern = compile_classifier_fwd(embed);
-            if (!finalRmsKern || !classifierKern) {
-                printf("finalRms or classifier compile failed\n");
-                g_compile_count = MAX_COMPILES; continue;
-            }
-            // Re-compile softmax if needed
-            if (!softmaxKern) {
-                softmaxKern = compile_softmax_kern();
-                if (!softmaxKern) { printf("softmax recompile failed\n"); return 1; }
+            // Compile final RMSNorm and classifier with current weights (if ane_extras)
+            if (ane_extras) {
+                free_kern(finalRmsKern); free_kern(classifierKern);
+                finalRmsKern = compile_final_rmsnorm_kern(rms_final);
+                classifierKern = compile_classifier_fwd(embed);
+                if (!finalRmsKern || !classifierKern) {
+                    printf("finalRms or classifier compile failed\n");
+                    g_compile_count = MAX_COMPILES; continue;
+                }
+                if (!softmaxKern) {
+                    softmaxKern = compile_softmax_kern();
+                    if (!softmaxKern) { printf("softmax recompile failed\n"); return 1; }
+                }
             }
 
             double cms = tb_ms(mach_absolute_time() - tc);
@@ -444,26 +468,46 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0);
                 }
 
-                // CHANGED: Final RMSNorm on ANE (was CPU)
                 t0=mach_absolute_time();
-                io_write_fp16(finalRmsKern->ioIn, x_cur, DIM, SEQ);
-                ane_eval(finalRmsKern);
-                io_read_fp16(finalRmsKern->ioOut, x_final, 0, DIM, SEQ);
-                t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
+                if (ane_extras) {
+                    // Final RMSNorm on ANE
+                    io_write_fp16(finalRmsKern->ioIn, x_cur, DIM, SEQ);
+                    ane_eval(finalRmsKern);
+                    io_read_fp16(finalRmsKern->ioOut, x_final, 0, DIM, SEQ);
+                    t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
 
-                // CHANGED: Classifier on ANE (was CPU cblas)
-                io_write_fp16(classifierKern->ioIn, x_final, DIM, SEQ);
-                ane_eval(classifierKern);
-                t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
+                    // Classifier on ANE
+                    io_write_fp16(classifierKern->ioIn, x_final, DIM, SEQ);
+                    ane_eval(classifierKern);
+                    t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
 
-                // CHANGED: Softmax on ANE, then read probs back for NLL on CPU
-                io_copy(softmaxKern->ioIn, 0, classifierKern->ioOut, 0, VOCAB, SEQ);
-                ane_eval(softmaxKern);
-                t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
+                    // Softmax on ANE
+                    io_copy(softmaxKern->ioIn, 0, classifierKern->ioOut, 0, VOCAB, SEQ);
+                    ane_eval(softmaxKern);
+                    t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
 
-                // Read probs back for NLL loss + gradient (needs target indexing — CPU)
-                io_read_fp16(softmaxKern->ioOut, probs, 0, VOCAB, SEQ);
-                t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
+                    io_read_fp16(softmaxKern->ioOut, probs, 0, VOCAB, SEQ);
+                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
+                } else {
+                    // CPU fallback: rmsnorm + classifier + softmax
+                    rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
+                    t1=mach_absolute_time(); t_rms+=tb_ms(t1-t0); t0=t1;
+
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                VOCAB, SEQ, DIM, 1.0f,
+                                embed, DIM, x_final, SEQ, 0.0f, probs, SEQ);
+                    t1=mach_absolute_time(); t_cls+=tb_ms(t1-t0); t0=t1;
+
+                    // CPU softmax
+                    for (int t = 0; t < SEQ; t++) {
+                        float maxv = -1e30f;
+                        for (int v = 0; v < VOCAB; v++) { float val = probs[v*SEQ+t]; if (val > maxv) maxv = val; }
+                        float sum = 0;
+                        for (int v = 0; v < VOCAB; v++) { probs[v*SEQ+t] = expf(probs[v*SEQ+t] - maxv); sum += probs[v*SEQ+t]; }
+                        for (int v = 0; v < VOCAB; v++) probs[v*SEQ+t] /= sum;
+                    }
+                    t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0); t0=t1;
+                }
 
                 // NLL loss + gradient on CPU: dlogits = probs - one_hot(targets)
                 float total_loss = 0;
@@ -531,17 +575,19 @@ int main(int argc, char *argv[]) {
                         free(capt_dffn); free(capt_silu); free(capt_dh1); free(capt_dh3); free(capt_x2n);
                     });
 
-                    // CHANGED: RMSNorm2 backward on ANE
-                    // Write concat(dx_ffn, x2) into rmsnorm_bwd kernel
-                    io_write_fp16_at(rmsFFNBwd[L]->ioIn, 0, dx_ffn, DIM, SEQ);
-                    io_write_fp16_at(rmsFFNBwd[L]->ioIn, DIM, ac->x2, DIM, SEQ);
-                    ane_eval(rmsFFNBwd[L]);
-                    io_read_fp16(rmsFFNBwd[L]->ioOut, dx2, 0, DIM, SEQ);
-                    // dw for rmsnorm_ffn still on CPU (accumulate per step)
+                    // RMSNorm2 backward
+                    if (ane_extras) {
+                        io_write_fp16_at(rmsFFNBwd[L]->ioIn, 0, dx_ffn, DIM, SEQ);
+                        io_write_fp16_at(rmsFFNBwd[L]->ioIn, DIM, ac->x2, DIM, SEQ);
+                        ane_eval(rmsFFNBwd[L]);
+                        io_read_fp16(rmsFFNBwd[L]->ioOut, dx2, 0, DIM, SEQ);
+                    }
+                    // dw for rmsnorm_ffn on CPU (accumulate per step)
                     {
                         float *dw_tmp = (float*)calloc(DIM, 4);
                         float *dx_scratch = (float*)malloc(SEQ*DIM*4);
                         rmsnorm_bwd(dx_scratch, dw_tmp, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+                        if (!ane_extras) memcpy(dx2, dx_scratch, SEQ*DIM*4);
                         for(int i=0;i<DIM;i++) gr->rms_ffn[i] += dw_tmp[i];
                         free(dx_scratch); free(dw_tmp);
                     }
@@ -591,17 +637,20 @@ int main(int argc, char *argv[]) {
                     ane_eval(kern[L].qkvBwd);
                     io_read_fp16(kern[L].qkvBwd->ioOut, dx_attn, 0, DIM, SEQ);
 
-                    // CHANGED: RMSNorm1 backward on ANE
-                    io_write_fp16_at(rmsAttBwd[L]->ioIn, 0, dx_attn, DIM, SEQ);
-                    io_write_fp16_at(rmsAttBwd[L]->ioIn, DIM, ac->layer_in, DIM, SEQ);
-                    ane_eval(rmsAttBwd[L]);
+                    // RMSNorm1 backward
                     float *dx_rms1 = (float*)malloc(SEQ*DIM*4);
-                    io_read_fp16(rmsAttBwd[L]->ioOut, dx_rms1, 0, DIM, SEQ);
-                    // dw for rmsnorm_att still on CPU
+                    if (ane_extras) {
+                        io_write_fp16_at(rmsAttBwd[L]->ioIn, 0, dx_attn, DIM, SEQ);
+                        io_write_fp16_at(rmsAttBwd[L]->ioIn, DIM, ac->layer_in, DIM, SEQ);
+                        ane_eval(rmsAttBwd[L]);
+                        io_read_fp16(rmsAttBwd[L]->ioOut, dx_rms1, 0, DIM, SEQ);
+                    }
+                    // dw for rmsnorm_att on CPU
                     {
                         float *dw_tmp = (float*)calloc(DIM, 4);
                         float *dx_scratch = (float*)malloc(SEQ*DIM*4);
                         rmsnorm_bwd(dx_scratch, dw_tmp, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+                        if (!ane_extras) memcpy(dx_rms1, dx_scratch, SEQ*DIM*4);
                         for(int i=0;i<DIM;i++) gr->rms_att[i] += dw_tmp[i];
                         free(dx_scratch); free(dw_tmp);
                     }

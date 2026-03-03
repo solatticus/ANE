@@ -6,33 +6,24 @@
 
 ---
 
-## What's new in this fork
+## Project timeline
 
-The original repo proved something remarkable: you can train neural networks on Apple's Neural Engine by reverse-engineering private APIs. But it had a fundamental bottleneck — **weights are baked into ANE programs at compile time**. Every time weights change, you recompile. The ANE compiler leaks memory and crashes after ~119 compilations. The workaround was `exec()` — kill the process, restart, reload from checkpoint, recompile, keep training. Every 10 steps.
+| Stage | Who | What happened | Key numbers |
+|-------|-----|---------------|-------------|
+| **API discovery** | [@maderix](https://github.com/maderix) | Reverse-engineered `_ANEClient`, `_ANECompiler`, `_ANEInMemoryModelDescriptor`. Proved you can compile and run custom MIL programs on the ANE outside CoreML. | First-ever direct ANE access via private APIs |
+| **Single-layer training** | @maderix | Forward + backward pass on ANE for a single transformer layer. 6 fused kernels. Channel-first layout, vDSP vectorized RMSNorm, GCD async overlap. | **9.3 ms/step**, 11.2% ANE utilization |
+| **12-layer Stories110M** | @maderix | Scaled to a full 109M-param Llama2-architecture model. Real tokenized TinyStories data. `exec()` restart to work around the ~119 compile limit. TUI dashboard. | **106.7 ms/step**, 72 kernels, 12 layers |
+| **ANE offload (PR#19)** | @maderix | Moved classifier (32K conv), softmax, and RMSNorm backward from CPU to ANE. Bridge API for C-callable ANE access. | **91.8 ms/step** (14% faster) |
+| **Dynamic weight pipeline** | [@solatticus](https://github.com/solatticus) | Eliminated recompilation entirely. Weights packed as extra spatial columns in IOSurface — ANE sees a wider tensor, doesn't know the extra columns are weights. 9 kernels compiled once at startup. | **0.3s compile (once). No `exec()`. Never recompile.** |
+| **LoRA fine-tuning** | @solatticus | Parameter-efficient fine-tuning on the dynamic pipeline. Rank-4 adapters on Wq/Wv. Freeze 109M params, train 147K. Skip 5 of 7 dW GEMMs per layer. | **2.9 MB checkpoints, 744x fewer params, zero recompile** |
 
-**This fork solves that problem.** We found a way to pass weights at runtime without recompilation, then built LoRA fine-tuning on top of it.
+### What the dynamic pipeline changes
 
-### The headline numbers
+The original repo had a fundamental bottleneck: **weights are baked into ANE programs at compile time.** Every time weights change, you recompile. The ANE compiler leaks memory and crashes after ~119 compilations. The workaround was `exec()` — kill the process, restart, reload from checkpoint, recompile, keep training. Every 10 steps. Clever, but compile overhead dominated wall time (75-82%).
 
-| What | Original repo | This fork |
-|------|--------------|-----------|
-| Model | Single transformer layer | **12-layer, 109M-param Stories110M** |
-| Training data | Synthetic/random | **Real tokenized TinyStories (20M tokens)** |
-| Recompilation | Every 10 steps + `exec()` restart | **Never. Compile once, train forever.** |
-| LoRA fine-tuning | No | **Yes — 147K trainable params, 2.9 MB checkpoints** |
-| Compile limit (~119) | Hit it, must `exec()` restart | **Eliminated** |
-| Parameter efficiency | Full 109M params | **744x reduction with LoRA** |
-| Checkpoint size | 438 MB (full weights) | **2.9 MB (LoRA adapters only)** |
-| Optimizer memory | ~1.7 GB | **~2.3 MB** |
-| Python bridge | No | **Yes — libane_bridge.dylib for ctypes** |
+The dynamic weight pipeline removes all of that. Compile cost drops to a one-time 333ms. The ANE just trains — no restarts, no compile limits, no process cycling.
 
-### Why this matters
-
-The original project's `exec()` restart was a clever hack, but it meant ANE training was a research demo — you couldn't just let it run. Compile overhead dominated wall time (75-82%), and every restart burned seconds reloading state.
-
-**With the dynamic weight pipeline, compile cost drops to a one-time 333ms.** The ANE just trains. No restarts, no compile limits, no process cycling. Combined with LoRA, you get parameter-efficient fine-tuning that produces tiny 2.9 MB adapter checkpoints — small enough to swap at inference time, share over a network, or store per-user.
-
-This is the difference between "we proved it's possible" and "you can actually use this."
+And that unlocks LoRA. When you don't have to recompile, you can merge new LoRA weights into the IOSurface every step for free. The result: parameter-efficient fine-tuning that produces 2.9 MB adapter checkpoints — small enough to swap at inference time, share over a network, or store per-user. No `exec()` restart. No compile limit. Just training.
 
 ---
 

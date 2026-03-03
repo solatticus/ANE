@@ -282,4 +282,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-*Original research by [@maderix](https://github.com/maderix). Fork extensions by solatticus + Claude.*
+*Original research by [@maderix](https://github.com/maderix). Fork extensions by [@solatticus](https://github.com/solatticus), built with Claude as an AI coding assistant.*

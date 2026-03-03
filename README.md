@@ -1,303 +1,173 @@
-# ANE Training — Backpropagation on Apple Neural Engine
+# ANE Training — LoRA Fine-Tuning on Apple Neural Engine, No Recompilation
 
-Training neural networks directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU — pure ANE compute.
+> **Fork of [maderix/ANE](https://github.com/maderix/ANE)** — the original project that proved backpropagation on the Apple Neural Engine is possible. All credit for the foundational reverse engineering, the private API discovery, the MIL code generation, and the single-layer training prototype goes to [@maderix](https://github.com/maderix). Read his excellent writeups: [Part 1](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine), [Part 2](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615).
+>
+> This fork extends the original with **LoRA fine-tuning** and a **dynamic weight pipeline that eliminates ANE recompilation entirely**.
 
-## TL;DR
+---
 
-Every Mac with Apple Silicon has a chip called the **Neural Engine** (ANE). It's a 15.8 TFLOPS accelerator — faster than most laptops' GPUs — but Apple only lets you use it for *running* AI models, not *training* them. That's a software restriction, not a hardware one.
+## What's new in this fork
 
-**This project removes that restriction.**
+The original repo proved something remarkable: you can train neural networks on Apple's Neural Engine by reverse-engineering private APIs. But it had a fundamental bottleneck — **weights are baked into ANE programs at compile time**. Every time weights change, you recompile. The ANE compiler leaks memory and crashes after ~119 compilations. The workaround was `exec()` — kill the process, restart, reload from checkpoint, recompile, keep training. Every 10 steps.
 
-We reverse-engineered Apple's private APIs and figured out how to run the full training loop — forward pass, backward pass, weight updates — directly on the Neural Engine. No GPU, no Metal, no CoreML training APIs. Just the ANE doing what Apple said it couldn't.
+**This fork solves that problem.** We found a way to pass weights at runtime without recompilation, then built LoRA fine-tuning on top of it.
 
-**What works today:**
-- Train a 109M-parameter transformer (12 layers, same architecture as Llama 2) on the ANE
-- LoRA fine-tuning with 2.9 MB checkpoints — adapts a pretrained model with 744x fewer parameters
-- Zero-recompile pipeline — compile once, train forever (we tried 5 different approaches before finding one that worked)
-- Python bridge — use the ANE from Python via a shared library, no Objective-C required
-- Real training data (TinyStories, 20M tokens), real loss curves, real checkpoints
+### The headline numbers
 
-**What it means:**
-- Every Mac is a training machine, not just an inference box
-- NPUs in general (Qualcomm, Intel, etc.) are likely training-capable too — the barrier is software everywhere
-- LoRA fine-tuning on-device could enable personal model adaptation without cloud GPUs
+| What | Original repo | This fork |
+|------|--------------|-----------|
+| Model | Single transformer layer | **12-layer, 109M-param Stories110M** |
+| Training data | Synthetic/random | **Real tokenized TinyStories (20M tokens)** |
+| Recompilation | Every 10 steps + `exec()` restart | **Never. Compile once, train forever.** |
+| LoRA fine-tuning | No | **Yes — 147K trainable params, 2.9 MB checkpoints** |
+| Compile limit (~119) | Hit it, must `exec()` restart | **Eliminated** |
+| Parameter efficiency | Full 109M params | **744x reduction with LoRA** |
+| Checkpoint size | 438 MB (full weights) | **2.9 MB (LoRA adapters only)** |
+| Optimizer memory | ~1.7 GB | **~2.3 MB** |
+| Python bridge | No | **Yes — libane_bridge.dylib for ctypes** |
 
-**Try it yourself** (macOS 15+, Apple Silicon):
-```bash
-git clone https://github.com/solatticus/ANE.git && cd ANE/training
-bash download_data.sh                     # grab training data (~41 MB)
-cd training_dynamic && make train_lora    # build the trainer
-./train_lora --steps 100 --lr 1e-4       # fine-tune on your Mac's Neural Engine
+### Why this matters
+
+The original project's `exec()` restart was a clever hack, but it meant ANE training was a research demo — you couldn't just let it run. Compile overhead dominated wall time (75-82%), and every restart burned seconds reloading state.
+
+**With the dynamic weight pipeline, compile cost drops to a one-time 333ms.** The ANE just trains. No restarts, no compile limits, no process cycling. Combined with LoRA, you get parameter-efficient fine-tuning that produces tiny 2.9 MB adapter checkpoints — small enough to swap at inference time, share over a network, or store per-user.
+
+This is the difference between "we proved it's possible" and "you can actually use this."
+
+---
+
+## How we eliminated recompilation
+
+We tried five approaches. Four failed. The failures are documented here because they reveal real ANE hardware constraints that anyone working with these APIs needs to know.
+
+**Attempt 1: Weight file swap.** Overwrite the weight blob on disk, unload and reload the model. Result: ANE ignores the file change — weights are baked at compile time and the reload serves the cached program. Confirmed on M4 and M5. **Dead end.**
+
+**Attempt 2: `weightsBuffer` IOSurface.** The `_ANERequest` API accepts a `weightsBuffer` parameter. We filled it with new weights and passed it at eval time. Result: output unchanged. The parameter serves some other internal purpose. **Dead end.**
+
+**Attempt 3: Multiple dynamic IOSurfaces.** Pass weights as separate IOSurface inputs alongside activations. Result: ANE rejects it with `status=0x1d` — the hardware only accepts a single dynamic input tensor. Code preserved in `stories_flex.h`. **Dead end.**
+
+**Attempt 4: Partial recompile.** Only recompile kernels whose weights changed (LoRA targets Wq/Wv — 24 of 72 kernels). Result: 2x speedup, but still recompiles, still hits the ~119 limit, still needs `exec()` every 70 steps. **Partial win, not the answer.**
+
+**Attempt 5: Pack weights into the spatial dimension.** The ANE takes input as `[1, channels, 1, spatial]`. We made the spatial dimension wider and packed weight matrices into the extra columns:
+
+```
+[1, DIM, 1, SEQ + weight_cols]
+         ^^^^          ^^^^^^^^^^^^^
+     activations       weights stuffed here
+         sp[0:256]     sp[256:256+768]
 ```
 
----
+The MIL graph uses `slice_by_size` to carve out the weight region, then `matmul` to multiply. The ANE has no idea the extra columns are weights — it just sees a wider input tensor.
 
-## Project Scope & Intent
+**Result: 9 kernels compiled once at startup. Zero recompilation. No compile limit. No `exec()` restart. Train forever.**
 
-I'm genuinely grateful for all the attention this project has received — I never expected a weekend research hack to blow up like this. Thank you to everyone who starred, forked, ran benchmarks on their own hardware, and shared the work. It means a lot.
+This is the key insight. Everything else — LoRA, the performance gains, the tiny checkpoints — builds on top of it.
 
-That said, I want to set clear expectations about what this project is and isn't.
+## LoRA on the Neural Engine
 
-This is a **research project**, not a production framework.
+With recompilation eliminated, LoRA becomes practical on the ANE.
 
-The goal was to demonstrate that **training on the Apple Neural Engine — and potentially other NPUs — is possible**, and that the barrier has always been software support, not hardware capability. The ANE is a remarkably capable piece of silicon that Apple restricts to inference-only use through CoreML. This project bypasses that restriction using reverse-engineered private APIs to show what's possible when you give the hardware a chance.
+**How it works:** Freeze all 109M pretrained weights. Train only small rank-4 matrices (A and B) on the Wq and Wv projections — 147,456 parameters total. Before each forward pass, merge on CPU: `W_eff = W_frozen + (alpha/rank) * B @ A`. This adds <1ms. The merged weights go into the IOSurface spatial dimension, the ANE runs the same 9 kernels, gradients flow back, and only the tiny LoRA matrices get updated.
 
-### What this project is
+**What we skip:** 5 of 7 weight gradient GEMMs per layer. The backward pass still runs all ANE kernels (you need activation gradients for backprop), but the expensive CPU-side `cblas_sgemm` calls for frozen weight gradients (dW1, dW2, dW3, dWo, dWk) are eliminated entirely.
 
-- A proof of concept for ANE training via `_ANEClient` and `_ANECompiler` private APIs
-- A set of benchmarks documenting real ANE performance characteristics (throughput, power, SRAM behavior)
-- A reference for anyone exploring direct ANE access outside CoreML
-- Research code that I update when I find something interesting
-
-### What this project is not
-
-- A maintained framework or library
-- A replacement for CoreML, MLX, llama.cpp, or any production inference stack
-- A path to training large models on consumer hardware (yet)
-
-### On the hype
-
-Some coverage of this project has overstated its implications. To be clear:
-
-- Training works, but utilization is low with significant engineering challenges remaining
-- Many element-wise operations still fall back to CPU
-- This does **not** replace GPU training for anything beyond small research models today
-
-The honest results — including all limitations — are documented in the accompanying articles:
-- [Part 1: Reverse Engineering](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine)
-- [Part 2: Benchmarks](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615)
-
-### Fork it, build on it
-
-This is MIT licensed for a reason. Everyone now has access to AI-assisted development tools that can adapt and extend code in hours. If this project is useful to you — take it, modify it, build something better. If you do something cool with it, I'd love to hear about it.
-
----
-
-## What This Is
-
-A from-scratch implementation of transformer training (forward + backward pass) running on the ANE in Apple Silicon. The ANE is a 15.8 TFLOPS (M4) inference accelerator that Apple does not expose for training. This project reverse-engineers the `_ANEClient` / `_ANECompiler` private APIs and the MIL (Model Intermediate Language) format to run custom compute graphs — including backpropagation — directly on ANE hardware.
-
-**Current results (M4 Pro, Stories110M — 12 layers, 109M params):**
-- 92-125 ms/step depending on pipeline and training mode
-- 12-layer Llama2-architecture transformer (dim=768, hidden=2048, 12 heads, 32K vocab)
-- Real tokenized training data (TinyStories, 20M tokens)
-- LoRA fine-tuning: 147K trainable params, 2.9 MB checkpoints, 744x parameter reduction
-- Zero-recompile dynamic pipeline: compile 9 kernels once, train forever
-- Adam optimizer, gradient accumulation, checkpoint/resume across `exec()` restarts
-- Python bridge API (`libane_bridge.dylib`) for using ANE from Python via ctypes
-
-## The Road to Zero Recompile
-
-The biggest engineering challenge in ANE training isn't the math — it's the compilation bottleneck. Weights are baked into ANE programs as constants at compile time. Every time weights change, you recompile. The ANE compiler leaks resources and dies after ~119 compilations per process. We tried everything to eliminate this.
-
-### What we tried and what broke
-
-**Attempt 1: Weight file swap.** Overwrite the weight blob on disk, unload and reload the model. Result: ANE ignores the file change. Weights are baked at compile time and the reload serves the cached program. **Dead end.**
-
-**Attempt 2: `weightsBuffer` IOSurface.** The `_ANERequest` API accepts a `weightsBuffer` parameter. We filled it with new weights and passed it at eval time. Result: output unchanged. The parameter likely serves a different internal purpose. **Dead end.**
-
-**Attempt 3: Multiple dynamic IOSurfaces.** Pass weights as separate IOSurface inputs alongside activations (`stories_flex.h`). Result: ANE rejects it with `status=0x1d`. The hardware only supports a single dynamic input tensor. **Dead end.**
-
-**Attempt 4: Partial recompile.** Only recompile the kernels whose weights changed (LoRA targets: Wq/Wv). Result: works — 2x speedup over full recompile. But still hits the compile limit, still needs `exec()` restart every 70 steps. **Partial win, not the answer.**
-
-### The breakthrough: weights as spatial columns
-
-**Attempt 5: Pack weights into the input tensor's spatial dimension.**
-
-The ANE takes a single input as `[1, channels, 1, spatial]`. What if we made the spatial dimension wider than the sequence length, and stuffed weight matrices into the extra columns?
-
-Layout: `[1, DIM, 1, SEQ + weight_cols]` — activations in `sp[0:SEQ]`, weights packed sequentially in `sp[SEQ:]`.
-
-The MIL graph uses `slice_by_size` to carve out the weight region and `matmul` to multiply. The ANE doesn't know the extra columns are weights — it just sees a wider tensor.
-
-**Result: 9 kernels compiled once at startup. Zero recompilation. No compile limit. No `exec()` restart. The dynamic weight pipeline.**
-
-This is the key insight that makes practical ANE training possible.
-
-## Architecture
-
-### Single-layer prototype (6 kernels per step)
-
-| Kernel | Function | Weights |
-|--------|----------|---------|
-| `kFwdAttn` | RMSNorm + QKV projection + SDPA + output projection | Wq, Wk, Wv, Wo, rms1, mask |
-| `kFwdFFN` | RMSNorm + SwiGLU FFN (W1, W3, SiLU, W2) | W1, W2, W3, rms2 |
-| `kFFNBwd` | FFN backward (W2^T + SiLU_bwd + W1^T + W3^T) | W2^T, W1^T, W3^T |
-| `kSdpaBwd1` | Wo^T + SDPA backward part 1 (dV, probs, dp) | Wo^T, mask |
-| `kSdpaBwd2` | SDPA backward part 2 (softmax grad, dQ, dK) | — |
-| `kQKVb` | QKV backward (Wq^T + Wk^T + Wv^T -> dx) | Wq^T, Wk^T, Wv^T |
-
-### Stories110M (12 layers, 109M params)
-
-Four training pipelines, each with different tradeoffs:
-
-| Pipeline | ms/step | Compile | Recompile? | Trainable params |
-|----------|---------|---------|------------|------------------|
-| Static baseline (`train_large`) | 106.7 | 7.6s/restart | Every 10 steps | 109M (full) |
-| Static + ANE extras (`train_large_ane`) | 91.8 | 9.6s/restart | Every 10 steps | 109M (full) |
-| Dynamic (`training_dynamic/train`) | 111 | 0.4s once | **Never** | 109M (full) |
-| Dynamic LoRA (`training_dynamic/train_lora`) | 125.6 | 0.3s once | **Never** | **147K (LoRA)** |
-
-CPU handles: RMSNorm backward, residual connections, loss computation, dW gradient accumulation (cblas_sgemm), Adam optimizer.
-
-### Key optimizations
-- **Channel-first layout** — `[1,C,1,S]` everywhere, matches ANE IOSurface format, zero transpose overhead
-- **Dynamic weight packing** — weights as extra spatial columns in single IOSurface
-- **vDSP vectorized math** — RMSNorm (10x faster), cross-entropy (8x faster)
-- **NEON fp16<->fp32** — ARM intrinsics for fast IOSurface data transfer
-- **GCD async cblas** — dW gradient sgemms overlap with ANE eval on background queue
-- **Deferred cblas wait** — pushed into next step's forward pass for maximum overlap
-- **ANE RMSNorm fusion** — folded into forward kernels as MIL ops
-- **Wo^T fusion** — output projection backward merged into SDPA backward kernel
-- **Forward taps** — intermediates (Q, K, V, scores) exposed via concat, avoiding CPU recompute
-- **Vocab compaction** — 32K -> 9.2K active tokens, 3.5x reduction in classifier compute
-
-## LoRA Fine-Tuning
-
-Low-Rank Adaptation with rank-4 matrices on Wq and Wv projections. Works on both static and dynamic pipelines.
+**Verified correct:**
+- Identity property: with fresh LoRA (B=0), loss matches pretrained model exactly at step 0
+- Gradient flow: |B| grows 49x over 1000 steps from near-zero init — consistent, linear growth
+- Checkpoint round-trip: parameter norms continue smoothly across save/resume boundaries
 
 | | Full Training | LoRA |
 |---|---|---|
 | Trainable params | 109,529,856 (438 MB) | 147,456 (576 KB) |
-| Reduction | — | **744x fewer params** |
-| Optimizer memory | ~1.7 GB (Adam m+v) | ~2.3 MB |
-| Checkpoint size | 438 MB | 2.9 MB |
-| dW GEMMs per layer | 7 | 2 (Wq, Wv only) |
+| Reduction | — | **744x fewer** |
+| Optimizer memory | ~1.7 GB | **~2.3 MB** |
+| Checkpoint | 438 MB | **2.9 MB** |
+| dW GEMMs/layer | 7 | **2** |
+| Recompilation | Never (dynamic) | **Never** |
 
-CPU-side merge: `W_eff = W_frozen + (alpha/rank) * B @ A` — adds <1ms per step. B initialized to zero ensures the model starts at the pretrained baseline (identity property verified: loss matches pretrained exactly at step 0). Gradient flow verified over 1000 steps: |B| grows 49x from near-zero init, consistent linear growth.
+---
 
-On the dynamic pipeline, LoRA eliminates 5 of 7 weight gradient GEMMs per layer *and* never recompiles — best of both worlds.
+## Quick start
 
-## Python Bridge
-
-`bridge/libane_bridge.dylib` — C-callable shared library wrapping all ANE private APIs, designed for Python ctypes:
-
-```c
-int ane_bridge_init(void);
-ANEKernelHandle *ane_bridge_compile(mil_text, mil_len, weight_data, weight_len, ...);
-bool ane_bridge_eval(ANEKernelHandle *kernel);
-void ane_bridge_write_input(kernel, idx, data, bytes);
-void ane_bridge_read_output(kernel, idx, data, bytes);
-void ane_bridge_free(ANEKernelHandle *kernel);
-```
-
-Handles IOSurface lifecycle, ARC memory management, compile retry logic, and the full compile->load->eval->unload flow.
-
-## File Structure
-
-```
-├── api_exploration.m           # Initial ANE API discovery and reverse engineering
-├── inmem_basic.m               # In-memory MIL compilation proof-of-concept
-├── inmem_bench.m               # ANE dispatch latency benchmarks
-├── inmem_peak.m                # Peak TFLOPS measurement (stacked 2048x2048 matmul)
-├── sram_bench.m                # ANE SRAM bandwidth probing
-├── sram_probe.m                # SRAM size/layout exploration
-├── bridge/
-│   ├── ane_bridge.h            # C-callable ANE bridge API
-│   ├── ane_bridge.m            # Bridge implementation (ObjC -> C)
-│   ├── libane_bridge.dylib     # Compiled shared library
-│   └── Makefile
-└── training/
-    ├── ane_runtime.h           # ANE private API wrapper
-    ├── ane_mil_gen.h           # MIL program generation helpers
-    ├── model.h                 # Weight init and blob builders
-    ├── forward.h               # Forward pass MIL generators
-    ├── backward.h              # Backward pass MIL generators
-    ├── stories_config.h        # Static pipeline: config, structs, alloc
-    ├── stories_io.h            # Static pipeline: IOSurface I/O, NEON, compile
-    ├── stories_mil.h           # Static pipeline: MIL generators (6 kernel types)
-    ├── stories_cpu_ops.h       # Static pipeline: vDSP RMSNorm, cross-entropy, Adam
-    ├── stories_flex.h          # Failed attempt: weights as separate IOSurfaces
-    ├── ane_classifier.h        # ANE classifier fwd (32K conv), softmax
-    ├── ane_rmsnorm_bwd.h       # ANE RMSNorm backward kernel
-    ├── lora.h                  # LoRA adapter: merge, gradient extract, checkpoint
-    ├── train.m                 # Minimal training loop (early prototype)
-    ├── tiny_train.m            # 2-layer tiny model training
-    ├── train_large.m           # Static baseline: 72 kernels, recompile every 10 steps
-    ├── train_large_ane.m       # Static + ANE extras: classifier/softmax/rmsnorm on ANE
-    ├── train_lora.m            # LoRA on static pipeline
-    ├── train_lora_flex.m       # LoRA with partial recompile (2x faster, still limited)
-    ├── dashboard.py            # TUI dashboard: loss curve, power, CPU, memory graphs
-    ├── download_data.sh        # Download pretokenized TinyStories from HuggingFace
-    ├── test_*.m                # Unit tests for individual kernels
-    ├── Makefile
-    └── training_dynamic/
-        ├── config.h            # Model config (DIM=768, HIDDEN=2048, etc.)
-        ├── io.h                # IOSurface I/O + dynamic weight packing
-        ├── cpu_ops.h           # CPU ops: RMSNorm, cross-entropy, Adam, vocab compaction
-        ├── mil_dynamic.h       # MIL generators using slice_by_size for dynamic weights
-        ├── lora.h              # LoRA adapter (dynamic pipeline version)
-        ├── train.m             # Dynamic full training: 9 kernels, zero recompile
-        ├── train_lora.m        # Dynamic LoRA: zero recompile + parameter efficient
-        └── Makefile
-```
-
-## Building
-
-Requires macOS 15+ on Apple Silicon (tested on M4, M4 Pro, M5).
+macOS 15+, Apple Silicon (tested on M4, M4 Pro, M5). No external dependencies.
 
 ```bash
-# Download training data (pretokenized TinyStories, ~41 MB)
-cd training && bash download_data.sh
+git clone https://github.com/solatticus/ANE.git && cd ANE/training
+bash download_data.sh                     # pretokenized TinyStories (~41 MB)
 
-# Static baseline
-make train_large && ./train_large --steps 100
-
-# Static + ANE extras (14% faster per step)
-make train_large_ane && ./train_large_ane --steps 100
-
-# Dynamic pipeline — zero recompile (recommended)
-cd training_dynamic && make train
-./train --scratch --steps 1000        # full training from random init
-./train --steps 1000                  # resume from checkpoint
-
-# Dynamic LoRA — zero recompile + parameter efficient (recommended for fine-tuning)
+# Dynamic LoRA — the recommended path
 cd training_dynamic && make train_lora
-./train_lora --steps 1000 --lr 1e-4   # fine-tune pretrained weights
+./train_lora --steps 1000 --lr 1e-4       # fine-tune on your Neural Engine
 
-# LoRA on static pipeline (for comparison)
-make train_lora && ./train_lora --steps 100 --lr 1e-4
+# Dynamic full training (all 109M params)
+make train && ./train --scratch --steps 1000
+
+# Dashboard (live loss curves, power, memory)
+pip install blessed psutil numpy
+sudo python3 ../dashboard.py --dynamic
 ```
 
-**CLI flags (all pipelines):**
+**CLI flags:**
 - `--steps N` — training steps (default 10000)
 - `--lr F` — learning rate (default 3e-4)
 - `--model PATH` — pretrained weights file
 - `--ckpt PATH` — checkpoint file
-- `--resume` — resume from checkpoint
-- `--scratch` — train from random initialization
-- `--no-ane-extras` — (train_large_ane only) fall back to CPU classifier/softmax
+- `--resume` / `--scratch` — resume from checkpoint or start fresh
 
-**Dashboard:**
+The original static pipelines are also preserved:
 ```bash
-pip install blessed psutil numpy
-sudo python3 dashboard.py              # static pipeline
-sudo python3 dashboard.py --dynamic    # dynamic pipeline
+# Original static baseline (for comparison)
+make train_large && ./train_large --steps 100
+
+# Static + ANE extras (PR#19 — classifier/softmax/rmsnorm on ANE)
+make train_large_ane && ./train_large_ane --steps 100
 ```
 
-## How It Works
+## Python bridge
 
-1. **MIL generation** — Objective-C constructs MIL program text at runtime: convolutions for linear layers, matmul for attention, softmax, element-wise ops. Dynamic pipeline adds `slice_by_size` to extract weight regions from the spatial dimension.
-2. **In-memory compilation** — `_ANEInMemoryModelDescriptor` compiles MIL text + weight blobs directly to ANE programs. No disk `.mlmodelc` needed.
-3. **IOSurface I/O** — Tensors passed via IOSurface shared memory in `[1, C, 1, S]` format (fp16). Dynamic pipeline packs weights into the spatial dimension: `[1, C, 1, SEQ + weight_cols]`.
-4. **Weight handling** — Static pipeline: weights baked as BLOBFILE constants, recompiled when changed. Dynamic pipeline: weights written to IOSurface at runtime, zero recompilation.
-5. **Gradient flow** — Forward taps expose intermediates; backward kernels compute dx (activation gradients) on ANE; dW (weight gradients) on CPU via cblas_sgemm. LoRA mode skips 5 of 7 dW GEMMs per layer.
+`bridge/libane_bridge.dylib` — wraps all ANE private APIs into C functions callable from Python via ctypes:
 
-## ANE Hardware Findings
+```c
+int ane_bridge_init(void);
+ANEKernelHandle *ane_bridge_compile(mil_text, mil_len, weight_data, weight_len, ...);
+ANEKernelHandle *ane_bridge_compile_multi_weights(mil_text, mil_len, names, datas, lens, n, ...);
+bool ane_bridge_eval(ANEKernelHandle *kernel);
+void ane_bridge_write_input(kernel, idx, data, bytes);
+void ane_bridge_read_output(kernel, idx, data, bytes);
+void ane_bridge_free(ANEKernelHandle *kernel);
+uint8_t *ane_bridge_build_weight_blob(src, rows, cols, out_len);
+```
 
-Through systematic probing (M4, M4 Pro, M5):
+Handles IOSurface lifecycle, ARC memory management, compile retry logic (100ms backoff on load failure), and compile count tracking for `exec()` budgeting.
 
-- **Compile limit:** ~119 compilations per process before the compiler leaks out. Workaround: `exec()` restart with checkpoint, or use the dynamic pipeline.
-- **SDPA causal masking:** ANE hardware ignores `attn_mask` in SDPA ops. Must decompose into Q@K^T, mask+softmax, scores@V as separate operations.
-- **Weight immutability:** Once compiled, weights cannot be changed via file swap, unload/reload, or `weightsBuffer`. They are baked at compile time.
-- **Single dynamic input:** ANE rejects multiple dynamic IOSurface inputs (`status=0x1d`). One input tensor only.
-- **QoS has no effect:** All QoS values 0-63 produce identical latency. ANE runs at fixed frequency.
-- **Chaining API exists:** `_ANEChainingRequest` supports loopback execution (output->input) — unexplored but promising for multi-layer pipelining.
-- **67 private classes** discovered via runtime introspection, many unexplored.
+---
 
 ## Performance
 
-### Single-layer prototype optimization history
+### This fork vs original — 20 steps on M4 Pro
+
+| | Original static | This fork: Dynamic | This fork: Dynamic LoRA |
+|---|---|---|---|
+| **Wall time** | **10.1s** | **~2.6s** | **~2.8s** |
+| Compile time | 7.6s (75%) | 0.4s (15%) | 0.3s (11%) |
+| Training time | 2.1s | 2.2s | 2.5s |
+| ms/step | 106.7 | 111 | 125.6 |
+| Recompile | Every 10 steps | **Never** | **Never** |
+| exec() restart | Yes | **No** | **No** |
+| Speedup (wall) | 1x | **3.9x** | **3.6x** |
+
+The per-step training time is similar — the ANE kernels do the same work. The difference is that the original spends 75% of wall time recompiling, and that compounds: at 100 steps, 1000 steps, 10000 steps, the dynamic pipeline just keeps pulling ahead.
+
+### LoRA: static vs dynamic pipeline
+
+| | Static LoRA | Dynamic LoRA |
+|---|---|---|
+| Compile | 3,400ms per batch | **333ms once** |
+| ms/step | ~400 | **125.6** |
+| exec() restart | Every 10 steps | **Never** |
+| Speedup | 1x | **3.2x** |
+
+### Single-layer optimization history (from original repo)
 
 | Optimization | ms/step | ANE util |
 |---|---|---|
@@ -309,31 +179,98 @@ Through systematic probing (M4, M4 Pro, M5):
 | Wo^T fusion (7->6 kernels) | 11.4 | 9.2% |
 | Deferred cblas wait | **9.3** | **11.2%** |
 
-### Stories110M (12 layers) — 20-step comparison
+---
 
-| | Static | Static + ANE | Dynamic | Dynamic LoRA |
-|---|---|---|---|---|
-| Wall time | 10.1s | 11.7s | **~2.6s** | **~2.8s** |
-| Compile | 7.6s (75%) | 9.6s (82%) | 0.4s (15%) | 0.3s (11%) |
-| ms/step | 106.7 | 91.8 | 111 | 125.6 |
-| Recompile? | Every 10 steps | Every 10 steps | **Never** | **Never** |
+## ANE hardware findings
 
-### LoRA training efficiency
+Discoveries from probing M4, M4 Pro, and M5 that informed the design:
 
-| Metric | Static LoRA | Dynamic LoRA |
-|---|---|---|
-| Compile | 3400ms/batch | **333ms once** |
-| ms/step | ~400 | **125.6** |
-| exec() restart | Every 10 steps | **Never** |
-| Speedup vs static | 1x | **3.2x** |
+- **Weights are immutable after compile.** File swap, unload/reload, `weightsBuffer` IOSurface — none of them change the output. Weights are baked. This is why the dynamic spatial packing approach was necessary.
+- **Single dynamic input only.** ANE rejects multiple IOSurface inputs with `status=0x1d`. You get one input tensor. This is why we pack weights into the spatial dimension of that one tensor.
+- **~119 compile limit per process.** The ANE compiler leaks resources. The original repo works around this with `exec()` restart. The dynamic pipeline eliminates it by compiling once.
+- **SDPA ignores causal mask.** ANE hardware ignores `attn_mask` in SDPA operations. Must decompose into Q@K^T, mask+softmax, scores@V as separate ops.
+- **QoS has no effect.** All values 0-63 produce identical latency. ANE runs at fixed frequency.
+- **Chaining API exists.** `_ANEChainingRequest` with loopback support — could enable multi-layer pipelining without CPU round-trips. Unexplored.
+- **67 private classes** discovered. Many unexplored (`_ANEDeviceController`, `_ANESharedEvents`, `_ANEProgramForEvaluation`).
+
+## Architecture details
+
+### 6 ANE kernels per training step (per layer)
+
+| Kernel | Function |
+|--------|----------|
+| `kFwdAttn` | RMSNorm + QKV projection + SDPA + output projection |
+| `kFwdFFN` | RMSNorm + SwiGLU FFN (W1, W3, SiLU, W2) |
+| `kFFNBwd` | FFN backward (W2^T + SiLU_bwd + W1^T + W3^T) |
+| `kSdpaBwd1` | Wo^T + SDPA backward part 1 (dV, probs, dp) |
+| `kSdpaBwd2` | SDPA backward part 2 (softmax grad, dQ, dK) |
+| `kQKVb` | QKV backward (Wq^T + Wk^T + Wv^T -> dx) |
+
+In the dynamic pipeline, these 6 kernel *types* become 9 compiled kernels (some split for the spatial packing layout) shared across all 12 layers. Weights are swapped via IOSurface writes between layers — same kernels, different data.
+
+### Key optimizations
+- **Channel-first layout** — `[1,C,1,S]` everywhere, matches ANE IOSurface format, zero transpose
+- **Dynamic weight packing** — weights as extra spatial columns in single IOSurface
+- **vDSP vectorized math** — RMSNorm 10x faster, cross-entropy 8x faster
+- **NEON fp16<->fp32** — ARM intrinsics for IOSurface data transfer
+- **GCD async cblas** — dW sgemms overlap with ANE eval on background queue
+- **Deferred cblas wait** — pushed into next step's forward pass
+- **ANE RMSNorm fusion** — folded into forward kernels as MIL ops
+- **Wo^T fusion** — output projection backward merged into SDPA backward
+- **Forward taps** — Q, K, V, scores exposed via concat, no CPU recompute
+- **Vocab compaction** — 32K -> 9.2K active tokens, 3.5x less classifier work
+
+## File structure
+
+```
+├── api_exploration.m           # ANE API discovery (from original)
+├── inmem_basic.m               # In-memory MIL compilation PoC (from original)
+├── inmem_bench.m               # ANE dispatch latency benchmarks (from original)
+├── inmem_peak.m                # Peak TFLOPS measurement (from original)
+├── sram_bench.m                # SRAM bandwidth probing (from original)
+├── sram_probe.m                # SRAM size/layout exploration (from original)
+├── bridge/                     # NEW — Python bridge
+│   ├── ane_bridge.h            # C-callable ANE bridge API
+│   ├── ane_bridge.m            # Bridge implementation (ObjC -> C)
+│   └── libane_bridge.dylib     # Compiled shared library
+└── training/
+    ├── ane_runtime.h           # ANE private API wrapper (from original)
+    ├── ane_mil_gen.h           # MIL generation helpers (from original)
+    ├── model.h                 # Weight init and blob builders (from original)
+    ├── forward.h               # Forward pass MIL generators (from original)
+    ├── backward.h              # Backward pass MIL generators (from original)
+    ├── stories_config.h        # Stories110M config/structs (from original)
+    ├── stories_io.h            # IOSurface I/O, NEON conversion (from original)
+    ├── stories_mil.h           # Static MIL generators (from original)
+    ├── stories_cpu_ops.h       # vDSP RMSNorm, cross-entropy, Adam (from original)
+    ├── train_large.m           # Static baseline trainer (from original)
+    ├── train_large_ane.m       # Static + ANE extras (from original, PR#19)
+    ├── ane_classifier.h        # ANE classifier/softmax (from original, PR#19)
+    ├── ane_rmsnorm_bwd.h       # ANE RMSNorm backward (from original, PR#19)
+    ├── dashboard.py            # TUI dashboard (from original)
+    ├── stories_flex.h          # NEW — failed multi-IOSurface attempt (preserved)
+    ├── lora.h                  # NEW — LoRA adapter: merge, gradients, checkpoint
+    ├── train_lora.m            # NEW — LoRA on static pipeline
+    ├── train_lora_flex.m       # NEW — LoRA with partial recompile
+    ├── BENCHMARK_LORA.md       # NEW — LoRA benchmark results
+    └── training_dynamic/       # NEW — dynamic weight pipeline
+        ├── config.h            # Model config
+        ├── io.h                # IOSurface I/O + dynamic weight packing
+        ├── cpu_ops.h           # CPU ops with vocab compaction
+        ├── mil_dynamic.h       # MIL generators using slice_by_size
+        ├── lora.h              # LoRA adapter (dynamic pipeline)
+        ├── train.m             # Dynamic full training (9 kernels, zero recompile)
+        ├── train_lora.m        # Dynamic LoRA (the whole point of this fork)
+        └── SESSION.md          # Development session notes
+```
 
 ## Limitations
 
-- **ANE utilization** — Still well below peak theoretical TFLOPS. Element-wise ops, CPU round-trips between layers, and data transfer overhead limit throughput.
-- **fp16 only** — ANE operates in fp16. Accumulation to fp32 happens on CPU, adding transfer overhead.
-- **Single model architecture** — Currently hardcoded for Stories110M (Llama2). Adapting to other architectures requires modifying MIL generators.
-- **macOS only** — Uses private frameworks that only exist on macOS/Apple Silicon.
-- **Private APIs** — May break with any macOS update. Tested on macOS 15.x (Sequoia).
+- **ANE utilization** — still below peak theoretical TFLOPS; element-wise ops and CPU round-trips between layers limit throughput
+- **fp16 only** — ANE operates in fp16; accumulation to fp32 on CPU adds transfer overhead
+- **Single model architecture** — hardcoded for Stories110M (Llama2); other architectures need MIL generator changes
+- **macOS only** — private frameworks, Apple Silicon only
+- **Private APIs** — may break on any macOS update; tested on 15.x (Sequoia)
 
 ## Disclaimer
 
@@ -345,4 +282,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-*Built by a human + Claude, one weekend at a time.*
+*Original research by [@maderix](https://github.com/maderix). Fork extensions by solatticus + Claude.*

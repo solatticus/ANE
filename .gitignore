@@ -1,0 +1,23 @@
+# Binaries
+training/train_large
+training/train_lora
+training/train_lora_flex
+training/test_compile_limit
+training/test_dynamic_matmul
+training/test_flex_probe
+training/test_latency_estimate
+training/training_dynamic/train
+training/training_dynamic/train_lora
+
+# Data & weights (too large for git)
+*.bin
+*.safetensors
+training/annie/models/
+training/annie/annie_train_data.bin
+
+# Logs & benchmarks
+*.log
+training/lora_bench*.jsonl
+
+# Compiled binary
+training/annie/train_lora

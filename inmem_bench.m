@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <CoreML/CoreML.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -9,18 +8,45 @@
 static mach_timebase_info_data_t g_tb;
 static double ticksToMs(uint64_t t) { return (double)t * g_tb.numer / g_tb.denom / 1e6; }
 
+static NSData *buildWeightBlob(int ch) {
+    NSUInteger wsize = (NSUInteger)ch * ch * 2;
+    NSUInteger total = 64 + 64 + wsize;
+    uint8_t *buf = calloc(total, 1);
+    buf[0] = 0x01; buf[4] = 0x02;
+    uint8_t *chunk = buf + 64;
+    chunk[0]=0xEF; chunk[1]=0xBE; chunk[2]=0xAD; chunk[3]=0xDE;
+    chunk[4]=0x01; chunk[10]=0x08;
+    uint16_t *fp16 = (uint16_t*)(chunk + 64);
+    for (NSUInteger j = 0; j < (NSUInteger)ch * ch; j++)
+        fp16[j] = (arc4random() & 0x03FF) | 0x2000;
+    return [NSData dataWithBytesNoCopy:buf length:total freeWhenDone:YES];
+}
+
+static NSString *genMIL(int ch, int sp) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:@"program(1.3)\n[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]\n{\n"];
+    [m appendFormat:@"    func main<ios18>(tensor<fp32, [1, %d, 1, %d]> x) {\n", ch, sp];
+    [m appendString:
+        @"        string c_pad_type = const()[name = string(\"c_pad_type\"), val = string(\"valid\")];\n"
+        @"        tensor<int32, [2]> c_strides = const()[name = string(\"c_strides\"), val = tensor<int32, [2]>([1, 1])];\n"
+        @"        tensor<int32, [4]> c_pad = const()[name = string(\"c_pad\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        @"        tensor<int32, [2]> c_dilations = const()[name = string(\"c_dilations\"), val = tensor<int32, [2]>([1, 1])];\n"
+        @"        int32 c_groups = const()[name = string(\"c_groups\"), val = int32(1)];\n"
+        @"        string to_fp16 = const()[name = string(\"to_fp16\"), val = string(\"fp16\")];\n"];
+    [m appendFormat:@"        tensor<fp16, [1, %d, 1, %d]> x16 = cast(dtype = to_fp16, x = x)[name = string(\"cast_in\")];\n", ch, sp];
+    [m appendFormat:@"        tensor<fp16, [%d, %d, 1, 1]> W = const()[name = string(\"W\"), val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n", ch, ch, ch, ch];
+    [m appendFormat:@"        tensor<fp16, [1, %d, 1, %d]> y16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W, x = x16)[name = string(\"conv\")];\n", ch, sp];
+    [m appendString:@"        string to_fp32 = const()[name = string(\"to_fp32\"), val = string(\"fp32\")];\n"];
+    [m appendFormat:@"        tensor<fp32, [1, %d, 1, %d]> y = cast(dtype = to_fp32, x = y16)[name = string(\"cast_out\")];\n", ch, sp];
+    [m appendString:@"    } -> (y);\n}\n"];
+    return m;
+}
+
 double benchInMem(int ch, int sp) {
     @autoreleasepool {
         NSError *e = nil;
-        NSString *path = [NSString stringWithFormat:@"/tmp/ane_sram_%dch_%dsp.mlpackage", ch, sp];
-        NSURL *compiled = [MLModel compileModelAtURL:[NSURL fileURLWithPath:path] error:&e];
-        if (e) return -1;
-
-        NSData *milData = [[NSString stringWithContentsOfFile:
-            [[compiled path] stringByAppendingPathComponent:@"model.mil"]
-            encoding:NSUTF8StringEncoding error:nil] dataUsingEncoding:NSUTF8StringEncoding];
-        NSData *weightBlob = [NSData dataWithContentsOfFile:
-            [[compiled path] stringByAppendingPathComponent:@"weights/weight.bin"]];
+        NSData *milData = [[genMIL(ch, sp) dataUsingEncoding:NSUTF8StringEncoding] copy];
+        NSData *wb = buildWeightBlob(ch);
 
         Class Desc = NSClassFromString(@"_ANEInMemoryModelDescriptor");
         Class IMM = NSClassFromString(@"_ANEInMemoryModel");
@@ -28,7 +54,7 @@ double benchInMem(int ch, int sp) {
         Class AIO = NSClassFromString(@"_ANEIOSurfaceObject");
 
         NSDictionary *wdict = @{
-            @"@model_path/weights/weight.bin": @{@"offset": @64, @"data": weightBlob}
+            @"@model_path/weights/weight.bin": @{@"offset": @0, @"data": wb}
         };
         id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
             Desc, @selector(modelWithMILText:weights:optionsPlist:),
@@ -43,7 +69,7 @@ double benchInMem(int ch, int sp) {
         [fm createDirectoryAtPath:[tmpDir stringByAppendingPathComponent:@"weights"]
             withIntermediateDirectories:YES attributes:nil error:nil];
         [milData writeToFile:[tmpDir stringByAppendingPathComponent:@"model.mil"] atomically:YES];
-        [weightBlob writeToFile:[tmpDir stringByAppendingPathComponent:@"weights/weight.bin"] atomically:YES];
+        [wb writeToFile:[tmpDir stringByAppendingPathComponent:@"weights/weight.bin"] atomically:YES];
 
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
             model, @selector(compileWithQoS:options:error:), 21, @{}, &e);

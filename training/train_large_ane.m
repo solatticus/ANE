@@ -9,7 +9,7 @@
 //               NLL loss + gradient (needs target indexing)
 //
 // Build: make train_large_ane
-// Run:   ./train_large_ane [--resume] [--steps N] [--lr F]
+// Run:   ./train_large_ane [--resume] [--steps N] [--lr F] [--data PATH]
 #include "stories_io.h"
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
@@ -18,7 +18,7 @@
 
 #define CKPT_PATH_DEFAULT "ane_stories110M_ckpt.bin"
 #define MODEL_PATH_DEFAULT "stories110M.bin"
-#define DATA_PATH "tinystories_data00.bin"
+#define DATA_PATH_DEFAULT "tinystories_data00.bin"
 
 // ===== Weight loading from llama2.c format =====
 static bool load_pretrained(LayerWeights *lw, float *rms_final, float *embed, const char *path) {
@@ -204,6 +204,7 @@ int main(int argc, char *argv[]) {
         int adam_t = 0, start_step = 0;
         const char *ckpt_path = CKPT_PATH_DEFAULT;
         const char *model_path = MODEL_PATH_DEFAULT;
+        const char *data_path = DATA_PATH_DEFAULT;
         bool do_resume = false;
         bool ane_extras = true;  // classifier, softmax, rmsnorm_bwd on ANE
         int pos = 0;
@@ -214,6 +215,7 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) lr = atof(argv[++i]);
             else if (strcmp(argv[i], "--ckpt") == 0 && i+1<argc) ckpt_path = argv[++i];
             else if (strcmp(argv[i], "--model") == 0 && i+1<argc) model_path = argv[++i];
+            else if (strcmp(argv[i], "--data") == 0 && i+1<argc) data_path = argv[++i];
             else if (argv[i][0] != '-') {
                 if (pos == 0) model_path = argv[i];
                 else if (pos == 1) { /* seq - compile-time constant */ }
@@ -252,15 +254,16 @@ int main(int argc, char *argv[]) {
             printf("dim=%d hidden=%d heads=%d seq=%d vocab=%d layers=%d\n", DIM, HIDDEN, HEADS, SEQ, VOCAB, NLAYERS);
             if (ane_extras) printf("NEW: final_rmsnorm, classifier_fwd, softmax, rmsnorm_bwd on ANE\n");
             else printf("ANE extras DISABLED (classifier/softmax/rmsnorm_bwd on CPU)\n");
-            if (!load_pretrained(lw, rms_final, embed, model_path)) {
-                printf("Pretrained load failed, using random init\n");
+            {
+                printf("  Training from scratch (random init)\n");
                 srand48(42);
                 float scale_d=1.0f/sqrtf(DIM), scale_h=1.0f/sqrtf(HIDDEN);
+                float res_scale = 1.0f/sqrtf(2.0f*NLAYERS); // LLaMA-style output proj scaling
                 for (int L=0; L<NLAYERS; L++) {
                     for(size_t i=0;i<WQ_SZ;i++){lw[L].Wq[i]=scale_d*(2*drand48()-1);lw[L].Wk[i]=scale_d*(2*drand48()-1);}
-                    for(size_t i=0;i<WQ_SZ;i++){lw[L].Wv[i]=scale_d*(2*drand48()-1);lw[L].Wo[i]=scale_d*(2*drand48()-1);}
+                    for(size_t i=0;i<WQ_SZ;i++){lw[L].Wv[i]=scale_d*(2*drand48()-1);lw[L].Wo[i]=scale_d*res_scale*(2*drand48()-1);}
                     for(size_t i=0;i<W1_SZ;i++) lw[L].W1[i]=scale_h*(2*drand48()-1);
-                    for(size_t i=0;i<W2_SZ;i++) lw[L].W2[i]=scale_d*(2*drand48()-1);
+                    for(size_t i=0;i<W2_SZ;i++) lw[L].W2[i]=scale_d*res_scale*(2*drand48()-1);
                     for(size_t i=0;i<W3_SZ;i++) lw[L].W3[i]=scale_h*(2*drand48()-1);
                     for(int i=0;i<DIM;i++){lw[L].rms_att[i]=1.0f; lw[L].rms_ffn[i]=1.0f;}
                 }
@@ -271,8 +274,12 @@ int main(int argc, char *argv[]) {
         }
 
         // mmap token data
-        int data_fd = open(DATA_PATH, O_RDONLY);
-        if (data_fd < 0) { printf("Cannot open %s\n", DATA_PATH); return 1; }
+        int data_fd = open(data_path, O_RDONLY);
+        if (data_fd < 0) {
+            printf("Cannot open token data: %s\n", data_path);
+            printf("Hint: run `bash download_data.sh` in training/ or pass --data /path/to/tinystories_data00.bin\n");
+            return 1;
+        }
         struct stat st; fstat(data_fd, &st);
         size_t data_len = st.st_size;
         uint16_t *token_data = (uint16_t*)mmap(NULL, data_len, PROT_READ, MAP_PRIVATE, data_fd, 0);
@@ -354,9 +361,9 @@ int main(int argc, char *argv[]) {
                 printf("[exec() restart step %d, %d compiles, loss=%.4f]\n", step, g_compile_count, last_loss);
                 fflush(stdout);
                 if (ane_extras)
-                    execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, NULL);
+                    execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, "--data", data_path, NULL);
                 else
-                    execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, "--no-ane-extras", NULL);
+                    execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, "--data", data_path, "--no-ane-extras", NULL);
                 perror("execl"); return 1;
             }
 

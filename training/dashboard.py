@@ -23,7 +23,7 @@ HD = DIM // HEADS
 CKPT_PATH_STATIC = 'ane_stories110M_ckpt.bin'
 CKPT_PATH_DYNAMIC = 'training_dynamic/ane_stories110M_dyn_ckpt.bin'
 CKPT_PATH = CKPT_PATH_STATIC  # set in main() based on --dynamic
-TOKENIZER_PATH = str(Path(__file__).resolve().parent.parent.parent / 'assets' / 'models' / 'tokenizer.bin')
+TOKENIZER_PATH = str(Path(__file__).resolve().parent.parent / 'assets' / 'models' / 'tokenizer.bin')
 
 
 class State:
@@ -147,7 +147,7 @@ def softmax(x):
     e = np.exp(x)
     return e / np.sum(e)
 
-def generate_text(W, tok, max_tokens=64, temperature=0.8):
+def generate_text(W, max_tokens=64, temperature=0.8):
     tokenizer = get_tokenizer()
     if tokenizer is None:
         return '[no tokenizer]'
@@ -162,12 +162,19 @@ def generate_text(W, tok, max_tokens=64, temperature=0.8):
             freq = 1.0 / (10000.0 ** (2.0 * i / HD))
             freqs[pos, i] = pos * freq
 
+    # KV cache: per-layer, per-head arrays
+    k_cache = [[np.zeros((0, HD), dtype=np.float32) for _ in range(HEADS)] for _ in range(NLAYERS)]
+    v_cache = [[np.zeros((0, HD), dtype=np.float32) for _ in range(HEADS)] for _ in range(NLAYERS)]
+
+    res_alpha = 1.0 / math.sqrt(2.0 * NLAYERS)
+
     for step in range(max_tokens):
         seq_len = len(tokens)
         if seq_len > SEQ:
             break
 
         x = W['embed'][tokens[-1]].copy()
+        pos = seq_len - 1
 
         for L in range(NLAYERS):
             # RMSNorm + QKV
@@ -177,7 +184,6 @@ def generate_text(W, tok, max_tokens=64, temperature=0.8):
             v = W[f'Wv{L}'] @ xn
 
             # RoPE
-            pos = seq_len - 1
             for h in range(HEADS):
                 for i in range(HD // 2):
                     freq = freqs[pos, i]
@@ -189,17 +195,21 @@ def generate_text(W, tok, max_tokens=64, temperature=0.8):
                     k[h * HD + 2 * i] = ki * cos_v - ki1 * sin_v
                     k[h * HD + 2 * i + 1] = ki * sin_v + ki1 * cos_v
 
-            # Attention (single token)
+            # Append to KV cache and compute attention
             o = np.zeros(DIM, dtype=np.float32)
             for h in range(HEADS):
                 qh = q[h * HD:(h + 1) * HD]
-                kh = k[h * HD:(h + 1) * HD]
-                vh = v[h * HD:(h + 1) * HD]
-                score = np.dot(qh, kh) / math.sqrt(HD)
-                o[h * HD:(h + 1) * HD] = vh
+                kh = k[h * HD:(h + 1) * HD].reshape(1, HD)
+                vh = v[h * HD:(h + 1) * HD].reshape(1, HD)
+                k_cache[L][h] = np.vstack([k_cache[L][h], kh])
+                v_cache[L][h] = np.vstack([v_cache[L][h], vh])
+                # scores: (1, HD) @ (HD, seq_len) -> (seq_len,)
+                scores = k_cache[L][h] @ qh / math.sqrt(HD)
+                attn = softmax(scores)
+                o[h * HD:(h + 1) * HD] = attn @ v_cache[L][h]
 
-            # Residual + output projection
-            x2 = x + W[f'Wo{L}'] @ o
+            # Residual + output projection (scaled residual, matches training)
+            x2 = x + res_alpha * (W[f'Wo{L}'] @ o)
 
             # FFN
             x2n = rmsnorm(x2, W[f'rms2_{L}'])
@@ -209,7 +219,7 @@ def generate_text(W, tok, max_tokens=64, temperature=0.8):
             h1 = h1 * (1.0 / (1.0 + np.exp(-h1))) * h3
             ffn_out = W[f'W2_{L}'] @ h1
 
-            x = x2 + ffn_out
+            x = x2 + res_alpha * ffn_out
 
         x = rmsnorm(x, W['rms_final'])
 
@@ -249,7 +259,7 @@ def generation_thread():
                 with S.gen_lock:
                     S.gen_status = 'idle'
                 continue
-            text = generate_text(W, get_tokenizer(), max_tokens=64, temperature=0.8)
+            text = generate_text(W, max_tokens=64, temperature=0.8)
             with S.gen_lock:
                 S.gen_text = text
                 S.gen_step = S.step
@@ -523,15 +533,19 @@ def draw(term):
 
     buf = []
 
-    def put(y, x, text, style=''):
+    def put(y, x, text, style='', clear_eol=False):
         if 0 <= y < h and x < w:
             text = text[:w - x]
+            suffix = term.clear_eol if clear_eol else ''
             if style:
-                buf.append(term.move(y, x) + style + text + term.normal)
+                buf.append(term.move(y, x) + style + text + term.normal + suffix)
                 return
-            buf.append(term.move(y, x) + text)
+            buf.append(term.move(y, x) + text + suffix)
 
-    buf.append(term.home + term.clear)
+    buf.append(term.home)
+    # Clear each line individually (avoids full-screen flash from term.clear)
+    for y in range(h):
+        buf.append(term.move(y, 0) + term.clear_eol)
 
     mid_x = w // 2
     right_w = w - mid_x - 1
@@ -764,7 +778,7 @@ def set_nonblock(fd):
     fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
 def spawn_training(resume=False, steps=10000, dynamic=False, ane=False, scratch=False,
-                   lr=None, accum=None, no_ane_extras=False):
+                   lr=None, accum=None, no_ane_extras=False, data=None):
     if dynamic:
         cmd = 'cd training_dynamic && make 2>&1 && ./train'
     elif ane:
@@ -781,6 +795,8 @@ def spawn_training(resume=False, steps=10000, dynamic=False, ane=False, scratch=
         cmd += f' --accum {accum}'
     if no_ane_extras and ane:
         cmd += ' --no-ane-extras'
+    if data is not None:
+        cmd += f' --data {data}'
     cmd += f' --steps {steps}'
     proc = subprocess.Popen(
         ['bash', '-c', cmd],
@@ -790,6 +806,8 @@ def spawn_training(resume=False, steps=10000, dynamic=False, ane=False, scratch=
     return proc
 
 def spawn_powermetrics():
+    if not sys.stdin.isatty():
+        return None
     try:
         proc = subprocess.Popen(
             ['sudo', 'powermetrics', '--samplers', 'cpu_power,gpu_power,ane_power', '-i', '1000'],
@@ -812,6 +830,7 @@ def main():
     parser.add_argument('--no-powermetrics', action='store_true')
     parser.add_argument('--no-generate', action='store_true', help='Disable text generation')
     parser.add_argument('--steps', type=int, default=10000, help='Total steps (default: 10000)')
+    parser.add_argument('--data', type=str, default=None, help='Path to training data shard (.bin)')
     args = parser.parse_args()
 
     if args.infinite:
@@ -826,7 +845,8 @@ def main():
 
     train_proc = spawn_training(resume=args.resume, steps=args.steps, dynamic=args.dynamic,
                                 scratch=args.scratch, lr=args.lr, accum=args.accum,
-                                ane=args.ane, no_ane_extras=args.no_ane_extras)
+                                ane=args.ane, no_ane_extras=args.no_ane_extras,
+                                data=args.data)
     S.train_pid = train_proc.pid
     procs.append(train_proc)
 
@@ -968,7 +988,8 @@ def main():
                             train_proc.wait()
                         train_proc = spawn_training(resume=True, steps=args.steps, dynamic=args.dynamic,
                                                         lr=args.lr, accum=args.accum,
-                                                        ane=args.ane, no_ane_extras=args.no_ane_extras)
+                                                        ane=args.ane, no_ane_extras=args.no_ane_extras,
+                                                        data=args.data)
                         S.train_pid = train_proc.pid
                         procs = [p for p in procs if p.poll() is None]
                         procs.append(train_proc)
@@ -982,7 +1003,7 @@ def main():
                             try:
                                 W = load_weights_from_ckpt(CKPT_PATH)
                                 if W:
-                                    text = generate_text(W, get_tokenizer(), max_tokens=64, temperature=0.8)
+                                    text = generate_text(W, max_tokens=64, temperature=0.8)
                                     with S.gen_lock:
                                         S.gen_text = text
                                         S.gen_step = S.step

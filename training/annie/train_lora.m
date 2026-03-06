@@ -78,6 +78,7 @@ int main(int argc, char *argv[]) {
         int accum_steps = 10;
         int warmup_steps = 50;
         float grad_clip = 1.0f;
+        float loss_scale = 256.0f; // fp16 loss scaling for ANE backward
         float min_lr_frac = 0.1f;
 
         bool do_resume = false;
@@ -274,6 +275,10 @@ int main(int argc, char *argv[]) {
             float loss = cross_entropy_loss(dlogits, logits, target_tokens, V, S);
             last_loss = loss;
 
+            // Loss scaling: scale dlogits to prevent fp16 underflow in ANE backward kernels
+            // All gradients flow scaled; divided out by loss_scale before Adam update
+            vDSP_vsmul(dlogits, 1, &loss_scale, dlogits, 1, (vDSP_Length)(S * V));
+
             // ═══ BACKWARD ═══
 
             // Classifier backward (frozen — compute dx only)
@@ -324,7 +329,7 @@ int main(int argc, char *argv[]) {
             // ── LoRA Adam update every accum_steps ──
             if ((step + 1) % accum_steps == 0 || step == total_steps - 1) {
                 dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
-                float gsc = 1.0f / accum_steps;
+                float gsc = 1.0f / (accum_steps * loss_scale);
                 adam_t++;
 
                 // Scale accumulated gradients

@@ -1,6 +1,27 @@
-# ANE Training — Backpropagation on Apple Neural Engine
+# ANE — Direct Apple Neural Engine Access (macOS + iOS)
 
-Training neural networks directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU — pure ANE compute.
+Training and inference on Apple's Neural Engine via reverse-engineered private APIs. No CoreML, no Metal, no GPU — pure ANE compute.
+
+## What's New: iOS Support
+
+**The ANE private API surface is identical on iOS.** Every class, selector, and layer type confirmed present in the iPhone 15 Pro dyld shared cache (iOS 26.3, build 23D8133). The bridge compiles for iOS arm64 with minimal changes.
+
+|  | macOS | iOS |
+|---|---|---|
+| **Private classes** | `_ANEInMemoryModel`, `_ANERequest`, etc. | Same — confirmed in dyld cache |
+| **MIL compiler** | `_ANECCompile`, `_ANECCompileJIT` | Same |
+| **IOSurface I/O** | `[1,C,1,S]` fp16 | Same |
+| **Layer types** | MatMul, Softmax, Conv, etc. | Same — all present |
+| **Bridge change** | `dlopen(framework_path)` | `dlopen(NULL)` fallback for shared cache |
+| **Status** | Training + inference working | **Compiles for arm64 — on-device test pending** |
+
+CoreML's E5RT runtime uses the same `_ANERequest` code path internally — these private APIs are the production inference path on both platforms.
+
+Reference inference workload: [NeuTTS](https://github.com/neuphonic/neutts) by Neuphonic (Apache 2.0) — on-device text-to-speech (~120M params) running entirely on ANE. See [ios/](ios/) for bridge code and smoke test.
+
+Full analysis process, commands, and findings: [iOS section below](#ios--direct-ane-access).
+
+---
 
 ## Project Scope & Intent
 

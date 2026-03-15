@@ -91,6 +91,14 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             wdict[name] = @{@"offset": @0, @"data": data};
         }
 
+        // Ghidra decompilation of -[_ANEInMemoryModelDescriptor initWithNetworkText:
+        //   weights:optionsPlist:isMILModel:] reveals an early-exit null check:
+        //   if ((networkText == nil) || (weights == nil)) { os_log_error(...); return nil; }
+        // Both params must be non-nil. Pass @{} when there are no weights.
+        // modelWithMILText: is a thin wrapper → alloc + initWithNetworkText:...:isMILModel:YES
+        // The weight dict format is: @{@"path": @{@"offset": @0, @"data": NSData}}
+        // Ghidra showed the init iterates sorted keys, calls allValues/firstObject on each
+        // value dict, and hashes the result for hexStringIdentifier.
         id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
             g_ANEDesc, @selector(modelWithMILText:weights:optionsPlist:),
             milData, wdict.count > 0 ? wdict : @{}, nil);
@@ -106,7 +114,10 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             return NULL;
         }
 
-        // Pre-populate temp dir
+        // Pre-populate temp dir with MIL text + weight files.
+        // hexStringIdentifier is a SHA-256 derived from the descriptor's contents
+        // (MIL text hash + weight data hash). The ANE compiler reads model.mil and
+        // weights/ from $TMPDIR/<hexStringIdentifier>/ during compileWithQoS:.
         id hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
         NSString *td = [NSTemporaryDirectory() stringByAppendingPathComponent:hx];
         NSFileManager *fm = [NSFileManager defaultManager];

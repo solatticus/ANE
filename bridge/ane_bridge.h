@@ -1,5 +1,21 @@
-// ane_bridge.h — C-callable bridge to ANE private APIs for Python ctypes
+// ane_bridge.h — C-callable bridge to ANE private APIs (macOS + iOS)
 // Wraps _ANEInMemoryModel via private AppleNeuralEngine.framework
+//
+// API surface reverse-engineered via:
+//   - Runtime introspection (NSClassFromString, objc_msgSend)
+//   - ipsw dyld shared cache analysis (iPhone 15 Pro, build 23D8133)
+//   - Ghidra 12.0.4 decompilation of macOS AppleNeuralEngine framework
+//
+// Key Ghidra findings:
+//   - modelWithMILText:weights:optionsPlist: is a thin wrapper around
+//     initWithNetworkText:weights:optionsPlist:isMILModel:YES
+//   - weights param MUST be non-nil (early null check returns nil silently)
+//   - weight dict values are iterated (sorted keys), hashed for hexStringIdentifier
+//   - ANE compiler reads model.mil + weights/ from $TMPDIR/<hexStringIdentifier>/
+//
+// ANE hardware constraints (empirical, M4 + A18 Pro):
+//   - Minimum tensor size for eval: 16 channels, 16 spatial
+//   - Smaller tensors compile+load but fail eval with status=0x1d
 
 #ifndef ANE_BRIDGE_H
 #define ANE_BRIDGE_H

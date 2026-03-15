@@ -1,74 +1,51 @@
-# ANE Training — Backpropagation on Apple Neural Engine
+# ANE — Direct Apple Neural Engine Access (macOS + iOS)
 
-Training neural networks directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU — pure ANE compute.
+Fork of [maderix/ANE](https://github.com/maderix/ANE). Training and inference on Apple's Neural Engine via reverse-engineered private APIs. No CoreML, no Metal, no GPU — pure ANE compute.
 
-## Project Scope & Intent
+This fork adds: **iOS support (confirmed on iPhone 16 Pro)**, the **Annie pipeline (Qwen2.5-3B LoRA)**, and **Ghidra-based reverse engineering** of the private framework internals.
 
-I'm genuinely grateful for all the attention this project has received — I never expected a weekend research hack to blow up like this. Thank you to everyone who starred, forked, ran benchmarks on their own hardware, and shared the work. It means a lot.
+## iOS — Confirmed Working
 
-That said, I want to set clear expectations about what this project is and isn't.
+Direct ANE hardware access on iOS, bypassing CoreML entirely. Compile, load, and eval of MIL programs on the A18 Pro Neural Engine — confirmed March 15, 2026 on iPhone 16 Pro running iOS 18.3.
 
-This is a **research project**, not a production framework.
+|  | macOS | iOS |
+|---|---|---|
+| **Private classes** | `_ANEInMemoryModel`, `_ANERequest`, etc. | Same — confirmed in dyld cache + on-device |
+| **MIL compiler** | `_ANECCompile`, `_ANECCompileJIT` | Same |
+| **IOSurface I/O** | `[1,C,1,S]` fp16 | Same |
+| **Layer types** | MatMul, Softmax, Conv, etc. | Same — all present |
+| **Bridge change** | `dlopen(framework_path)` | `dlopen(NULL)` fallback for shared cache |
+| **Smoke test** | conv [16,16,1,16] identity | **PASS** — hardware eval confirmed |
 
-The goal was to demonstrate that **training on the Apple Neural Engine — and potentially other NPUs — is possible**, and that the barrier has always been software support, not hardware capability. The ANE is a remarkably capable piece of silicon that Apple restricts to inference-only use through CoreML. This project bypasses that restriction using reverse-engineered private APIs to show what's possible when you give the hardware a chance.
+### How We Got Here
 
-### What This Project Is
+1. **ipsw dyld cache extraction** — Pulled the iPhone 15 Pro shared cache (build 23D8133), confirmed all 4 private classes present with identical selectors
+2. **Ghidra 12.0.4 decompilation** — Decompiled `initWithNetworkText:weights:optionsPlist:isMILModel:` from the macOS framework. Key findings:
+   - `weights` parameter has an early null check — must pass `@{}`, not `nil`, even for weightless programs
+   - `modelWithMILText:weights:optionsPlist:` is a thin wrapper that calls `alloc` + `initWithNetworkText:...:isMILModel:YES`
+   - Weight dict values are iterated (sorted keys), `allValues`/`firstObject` extracted, hashed for `hexStringIdentifier`
+   - The ANE compiler reads `model.mil` + `weights/` from `$TMPDIR/<hexStringIdentifier>/` during `compileWithQoS:`
+3. **Empirical testing** — ANE hardware requires minimum **16 channels AND 16 spatial** for eval. Smaller tensors compile and load but fail at eval with `status=0x1d "Program Inference error"`. Confirmed on both M4 (macOS) and A18 Pro (iOS).
 
-- A proof of concept for ANE training via `_ANEClient` and `_ANECompiler` private APIs
-- A set of benchmarks documenting real ANE performance characteristics (throughput, power, SRAM behavior)
-- A reference for anyone exploring direct ANE access outside CoreML
-- Research code that I update when I find something interesting
+CoreML's E5RT runtime uses the same `_ANERequest` code path internally — these private APIs are the production inference path on both platforms.
 
-### What This Project Is Not
+### Constraints
 
-- A maintained framework or library
-- A replacement for CoreML, MLX, llama.cpp, or any production inference stack
-- A path to training large models on consumer hardware (yet)
-
-### On The Hype
-
-Some coverage of this project has overstated its implications. To be clear:
-
-- Training works, but utilization is low (~5-9% of peak) with significant engineering challenges remaining
-- Many element-wise operations still fall back to CPU
-- This does **not** replace GPU training for anything beyond small research models today
-
-The honest results — including all limitations — are documented in the accompanying articles:
-- [Part 1: Reverse Engineering](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine)
-- [Part 2: Benchmarks](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615)
-- [Part 3: Training](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-c8b)
-
-### On Maintenance
-
-I don't intend to grow this into a large community project. My focus is on original research (compiler infrastructure for edge AI optimization), and maintaining an open-source framework takes time away from that.
-
-That said:
-- I'll keep pushing updates when I discover something interesting
-- Bug fixes and benchmark contributions (especially on hardware I don't own) are welcome
-- Feature requests will likely go unaddressed — but feel free to fork
-- PRs will be merged at a relatively slow pace, otherwise I become the bottleneck for community growth around this tech
-
-### Fork it, build on it
-
-This is MIT licensed for a reason. Everyone now has access to AI-assisted development tools that can adapt and extend code in hours. If this project is useful to you — take it, modify it, build something better. If you do something cool with it, I'd love to hear about it.If in future, community decides to maintain one source of truth repo, I'm in full support of that.
-
----
+- **App Store**: Private API usage = guaranteed rejection. Sideload via Xcode developer signing only.
+- **Memory**: iOS terminates apps over ~1.5GB. Model weights must fit within budget.
+- **Thermal**: iPhone thermal envelope is tighter than Mac. Sustained workloads may throttle.
 
 ## What This Is
 
 A from-scratch implementation of transformer training (forward + backward pass) running on the ANE in Apple Silicon. The ANE is a 15.8 TFLOPS FP16 (M4) inference accelerator that Apple does not expose for training. This project reverse-engineers the `_ANEClient` / `_ANECompiler` private APIs and the MIL (Model Intermediate Language) format to run custom compute graphs — including backpropagation — directly on ANE hardware.
 
-**Current results:**
+**Training results:**
 
 | Model | Params | ms/step | Pipeline |
 |-------|--------|---------|----------|
 | Stories110M (12L, dim=768, MHA 12/12) | 109M | **91 ms** | Dynamic (no recompile) |
 | Qwen3-0.6B (28L, dim=1024, GQA 16/8) | 596M | **412 ms** | Dynamic (no recompile) |
-
-- All forward and backward dx passes on ANE, dW gradients on CPU (Accelerate cblas)
-- Adam optimizer, gradient accumulation, checkpoint/resume via exec() restart
-- GQA (Grouped-Query Attention) support with per-head tiling/reduction
-- GPU↔ANE zero-copy pipeline via shared IOSurface (GPU prefill → ANE decode)
+| Qwen2.5-3B (36L, dim=2048, GQA 16/2) | 3B | **~135 s** | Annie (LoRA rank 8) |
 
 **INT8 W8A8 quantization — 1.88x throughput (M4, H16G):**
 
@@ -77,7 +54,17 @@ A from-scratch implementation of transformer training (forward + backward pass) 
 | 128x conv 512ch 64x64 | 18.6 TOPS, 14.8ms | 35.1 TOPS, 7.8ms | **1.88x** |
 | 64x conv 512ch 64x64 | 18.4 TOPS, 7.5ms | 34.1 TOPS, 4.0ms | **1.85x** |
 
-INT8 activations halve L2 SRAM bandwidth between tiles via MIL `quantize`/`dequantize` ops. Weights use `constexpr_affine_dequantize` (int8 stored, fp16 at compile time).
+## Annie — Qwen2.5-3B LoRA Training on ANE
+
+First 3B parameter model trained on Apple Neural Engine:
+
+- **Model**: Qwen2.5-3B (36 layers, 2048-dim, GQA 16/2 heads, 151K vocab)
+- **Method**: LoRA rank 8 on Wq/Wv — 1.84M trainable params (0.06% of 3B)
+- **Kernels**: 4 dynamic kernels shared across all 36 layers
+- **Speed**: ~135s/step, 324 ANE evals/step (144 forward + 180 backward)
+- **Hardware**: M4 Pro, 24GB unified memory, 16-core ANE
+- **Stability**: Zero crashes, zero ANE errors across extended training runs
+- **Loss scaling**: 256x FP16 loss scaling — ANE backward matmul products flush to zero without it
 
 ## Architecture
 
@@ -92,138 +79,117 @@ The dynamic pipeline uses shared ANE kernels with weights packed into spatial di
 | `ffnBwdW2t` / `ffnBwdW13t` | FFN backward (split for memory) |
 | `sdpaBwd1` / `sdpaBwd2` | SDPA backward |
 
-**GQA models (Qwen3-0.6B) — 10 kernels per layer:**
-Adds separate `woFwd`, `qBwd`, `kvBwd` kernels for grouped-query attention (Q_DIM ≠ DIM).
-
-CPU handles: RMSNorm forward/backward, residual connections (DeepNet α scaling), loss computation, dW gradient accumulation (cblas_sgemm), Adam optimizer updates.
+**GQA models (Qwen3-0.6B) — 10 kernels per layer.**
+**Annie (Qwen2.5-3B) — 4 shared kernels** (`qkvProj`, `dimToHidden`, `hiddenToDim`, `dimToDim`).
 
 Key optimizations:
 - **Channel-first CPU layout** — matches ANE IOSurface `[1,C,1,S]` format, eliminates all transpose overhead
-- **vDSP vectorized RMSNorm** — 10x faster than naive (6.7ms → 0.7ms)
-- **GCD async cblas overlap** — dW gradient sgemms run in parallel with ANE evals on a serial dispatch queue
-- **Deferred cblas wait** — wait pushed into next step's forward pass for maximum overlap
-- **ANE RMSNorm fusion** — RMSNorm folded into forward kernels as MIL ops (reduce_sum + pow + mul)
-- **Wo^T fusion** — output projection backward merged into SDPA backward kernel
-- **Forward taps** — Q, K, V, attention scores, hidden states exposed via concat outputs, avoiding CPU recompute
+- **vDSP vectorized RMSNorm** — 10x faster than naive (6.7ms -> 0.7ms)
+- **GCD async cblas overlap** — dW gradient sgemms run in parallel with ANE evals
+- **FP16 loss scaling** — 256x scaling prevents gradient underflow in ANE backward matmuls
 - **exec() restart** — bypasses ~119 ANE compile limit per process
 
 ## File Structure
 
 ```
-├── api_exploration.m           # Initial ANE API discovery
-├── inmem_basic.m               # In-memory MIL compilation proof-of-concept
-├── inmem_bench.m               # ANE dispatch latency benchmarks
-├── inmem_peak.m                # Peak TFLOPS measurement (2048x2048 matmul)
-├── ane_int8_bench.m            # INT8 W8A8 vs FP16 throughput benchmark
-├── sram_bench.m                # ANE SRAM bandwidth probing
-├── sram_probe.m                # SRAM size/layout exploration
-├── gpu_ane_share.m             # GPU↔ANE zero-copy IOSurface demo
-├── gpu_prefill_ane_decode.m    # GPU prefill → ANE decode pipeline
-├── bridge/
-│   ├── ane_bridge.h            # C-callable ANE API (compile, eval, I/O)
-│   ├── ane_bridge.m            # Bridge implementation (int8 + fp16 weight blobs)
-│   └── Makefile
-└── training/
-    ├── ane_runtime.h           # ANE private API wrapper (compile, eval, IOSurface)
-    ├── ane_classifier.h        # Classifier fwd (32K conv), softmax, rmsnorm on ANE
-    ├── train_large.m           # Static pipeline (weights as constants, recompiles)
-    ├── training_dynamic/
-    │   ├── train.m             # Dynamic training loop (model-agnostic)
-    │   ├── config.h            # Derived sizes, structs, alloc helpers
-    │   ├── mil_dynamic.h       # MIL generators for dynamic weight kernels (GQA-aware)
-    │   ├── io.h                # IOSurface I/O, weight staging, GQA tile/reduce
-    │   ├── models/
-    │   │   ├── stories110m.h   # Stories110M config (12L, MHA)
-    │   │   └── qwen3_06b.h    # Qwen3-0.6B config (28L, GQA)
-    │   └── Makefile
-    ├── dashboard.py            # Live training dashboard (blessed TUI)
-    └── Makefile
-```
+ane_int8_bench.m                    # INT8 W8A8 vs FP16 throughput benchmark
+api_exploration.m                   # Initial ANE API discovery
+inmem_basic.m                       # In-memory MIL compilation proof-of-concept
+inmem_bench.m                       # ANE dispatch latency benchmarks
+inmem_peak.m                        # Peak TFLOPS measurement
+sram_bench.m / sram_probe.m        # ANE SRAM bandwidth probing
+gpu_ane_share.m                     # GPU<>ANE zero-copy IOSurface demo
+gpu_prefill_ane_decode.m            # GPU prefill -> ANE decode pipeline
 
-## Training Data
+bridge/
+  ane_bridge.h                      # C-callable ANE API (compile, eval, I/O, int8)
+  ane_bridge.m                      # ObjC implementation (macOS + iOS)
+  Makefile
 
-Training requires pretokenized TinyStories data. To download:
-```bash
-cd training && bash download_data.sh
+ios/                                # iOS port
+  bridge/
+    ane_bridge.h                    # iOS-adapted C API header (Ghidra-annotated)
+    ane_bridge.m                    # iOS bridge (dlopen fallback for shared cache)
+    ANEEngine.swift                 # Swift wrapper for ANE C API
+    ANESmokeTest.swift              # SwiftUI smoke test (conv [16,16,1,16] identity)
+  Oscar-Bridging-Header.h          # Exposes C API to Swift
+
+training/
+  ane_runtime.h                     # ANE private API wrapper (compile, eval, IOSurface)
+  ane_mil_gen.h                     # MIL program generation (conv, matmul, QKV, FFN)
+  model.h                          # Model weight loading and kernel compilation
+  train_large.m                     # Static pipeline (Stories110M)
+  dashboard.py                      # Live training dashboard (multi-model, W&B)
+  training_dynamic/                 # Dynamic weight pipeline
+    train.m                         # Dynamic training loop
+    config.h / mil_dynamic.h / io.h
+  annie/                            # Qwen2.5-3B LoRA fine-tuning
+    config.h                        # Qwen2.5-3B architecture (36L, 2048-dim, GQA 16/2)
+    mil_dynamic.h                   # 4 shared dynamic kernels
+    forward.h / backward.h         # Forward + backward pass (FP16 loss scaling)
+    cpu_ops.h                       # RMSNorm, cross-entropy, Adam
+    io.h / lora.h                   # IOSurface I/O, LoRA rank-8
+    train_lora.m                    # Main training loop
+    convert_weights.py              # HuggingFace safetensors -> ANE binary
+    tokenize_data.py                # Conversation JSONL -> tokenized binary
 ```
-See [training/README.md](training/README.md) for detailed training instructions.
 
 ## Building
 
-Requires macOS 15+ on Apple Silicon (tested on M4).
+Requires macOS 15+ on Apple Silicon.
 
 ```bash
-# Dynamic pipeline (recommended) — model selected at build time
-cd training/training_dynamic
-make MODEL=stories110m    # Stories110M (12L, MHA, 109M params)
-make MODEL=qwen3_06b      # Qwen3-0.6B (28L, GQA, 596M params)
-./train --scratch          # train from random init
-./train --resume           # resume from checkpoint
+# Bridge library (C-callable ANE API)
+cd bridge && make
 
-# Static pipeline (legacy — recompiles weights each step)
-cd training && make train_large
-./train_large ane_stories110M_ckpt.bin 256 100 1e-4
+# Dynamic pipeline (recommended)
+cd training/training_dynamic
+make MODEL=stories110m
+./train --scratch
+
+# Annie / Qwen2.5-3B LoRA
+cd training/annie && make train_lora
+python convert_weights.py --model Qwen/Qwen2.5-3B --output qwen3b_weights.bin
+python tokenize_data.py --input conversations.jsonl --output annie_train_data.bin
+./train_lora --steps 1000 --lr 1e-4 --accum 10
 
 # INT8 benchmark
 xcrun clang -O2 -fobjc-arc -framework Foundation -framework IOSurface -ldl \
   -o ane_int8_bench ane_int8_bench.m
 ./ane_int8_bench
-
-# Bridge library (C-callable ANE API)
-cd bridge && make
 ```
 
-No external dependencies. Uses only system frameworks + private ANE APIs resolved at runtime via `objc_msgSend`.
+No external dependencies for C code. Uses only system frameworks + private ANE APIs resolved at runtime via `objc_msgSend`.
 
 ## How It Works
 
-1. **MIL generation** — Objective-C code constructs MIL program text at runtime, specifying convolutions (for linear layers), matmul (for attention), softmax, element-wise ops
+1. **MIL generation** — Objective-C code constructs MIL program text at runtime (convolutions for linear layers, matmul for attention, softmax, element-wise ops)
 2. **In-memory compilation** — `_ANEInMemoryModelDescriptor` compiles MIL text + weight blobs directly to ANE programs, no disk mlmodelc needed
-3. **IOSurface I/O** — Input/output tensors passed via IOSurface shared memory in `[1, channels, 1, spatial]` format (fp16 or fp32; fp16 direct I/O is ~37% faster)
-4. **Dynamic weights** — Activations and weights packed into a single spatial input dimension, sliced apart inside the MIL kernel. Weights change without recompilation.
-5. **Gradient flow** — Forward taps expose intermediates needed for backward; backward kernels compute dx (input gradients) on ANE; dW (weight gradients) computed on CPU via cblas
-6. **INT8 quantization** — `constexpr_affine_dequantize` for int8 weights, `quantize`/`dequantize` between layers for int8 activation caching in L2 SRAM (1.88x throughput)
+3. **IOSurface I/O** — Input/output tensors via IOSurface shared memory in `[1, channels, 1, spatial]` format
+4. **Dynamic weights** — Activations and weights packed into a single spatial input dimension, sliced apart inside the MIL kernel. Weights change without recompilation
+5. **Gradient flow** — Forward taps expose intermediates for backward; backward kernels compute dx on ANE; dW computed on CPU via cblas
+6. **INT8 quantization** — `constexpr_affine_dequantize` for int8 weights, `quantize`/`dequantize` for int8 activation caching in L2 SRAM
 
 ## Limitations
 
-- **SDPA causal masking** — ANE hardware ignores `attn_mask` in SDPA ops; causal attention is decomposed into separate Q@K^T (ANE) → mask+softmax (CPU) → scores@V (ANE)
-- **~119 compile limit** — ANE compiler leaks resources; worked around via `exec()` restart with checkpoint
-- **FP16 gradient underflow** — backward matmuls underflow in fp16; fixed with global loss scaling (`256 * NLAYERS`)
+- **SDPA causal masking** — ANE hardware ignores `attn_mask` in SDPA ops; causal attention decomposed into separate Q@K^T -> mask+softmax -> scores@V
+- **~119 compile limit** — ANE compiler leaks resources; worked around via `exec()` restart
+- **FP16 gradient underflow** — backward matmuls underflow in fp16; fixed with 256x loss scaling
+- **Minimum tensor size** — ANE eval requires >= 16 channels and >= 16 spatial. Smaller tensors compile but fail at eval with 0x1d
 - **Single-input constraint** — multi-input ANE requests cause 0x1d error; inputs packed into spatial dimension instead
 
-## Performance
+## Upstream
 
-**Training throughput (M4):**
+This is a fork of [maderix/ANE](https://github.com/maderix/ANE). Upstream contributions (INT8, multi-model dashboard) are merged periodically. Our additions (iOS port, Annie pipeline, Ghidra RE) live here. See upstream for the original author's articles:
 
-| Model | Params | ms/step | Layers | Kernels/layer |
-|-------|--------|---------|--------|---------------|
-| Stories110M | 109M | 91 ms | 12 | 6 (MHA) |
-| Qwen3-0.6B | 596M | 412 ms | 28 | 10 (GQA) |
-
-**ANE peak throughput (M4, H16G):**
-
-| Precision | Peak TOPS | Config |
-|-----------|-----------|--------|
-| FP16 | 18.6 | 128x conv 512ch 64x64 |
-| INT8 W8A8 | 35.1 | 128x conv 512ch 64x64 |
-
-**GPU↔ANE inference pipeline (M4, seq=256):**
-
-| Model | GPU Prefill | ANE Decode | Total |
-|-------|------------|------------|-------|
-| Stories110M | 6.7ms | 1.9ms | 8.8ms |
-| Qwen3-0.6B | 9.7ms | 2.3ms | 12.0ms |
+- [Part 1: Reverse Engineering](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine)
+- [Part 2: Benchmarks](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615)
+- [Part 3: Training](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-c8b)
 
 ## Disclaimer
 
-This project uses Apple's private, undocumented APIs (`_ANEClient`, `_ANECompiler`, `_ANEInMemoryModelDescriptor`). These APIs are not covered by any public stability guarantee and may change or break with any macOS update. This is independent research into Apple Neural Engine architecture, using APIs discovered through runtime introspection for research and educational purposes under fair use and interoperability provisions (see *Sega v. Accolade*, 1992; DMCA §1201(f)). No Apple proprietary code or binaries are included in this repository. This project is not affiliated with or endorsed by Apple Inc. Use at your own risk.
+This project uses Apple's private, undocumented APIs (`_ANEClient`, `_ANECompiler`, `_ANEInMemoryModelDescriptor`). These APIs are not covered by any public stability guarantee and may change or break with any OS update. This is independent research into Apple Neural Engine architecture, using APIs discovered through runtime introspection and binary analysis for research and educational purposes under fair use and interoperability provisions (see *Sega v. Accolade*, 1992; DMCA 1201(f)). No Apple proprietary code or binaries are included in this repository. This project is not affiliated with or endorsed by Apple Inc. Use at your own risk.
 
 ## License
 
 MIT — see [LICENSE](LICENSE)
-
----
-
-*Built by a human + Claude, one weekend at a time.*
-
-

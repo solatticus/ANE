@@ -384,6 +384,7 @@ int main(int argc, char *argv[]) {
         dispatch_group_t dw_grp = dispatch_group_create();
 
         float last_loss = 999.0f;
+        float best_loss = resume_loss > 0 ? resume_loss : 999.0f;
         double total_train_ms = 0;
         int total_steps_done = 0;
         uint64_t t_wall_start = mach_absolute_time();
@@ -875,12 +876,14 @@ int main(int argc, char *argv[]) {
                 memset(gembed, 0, (size_t)VOCAB*DIM*4);
                 memset(gcembed, 0, (size_t)CV*DIM*4);
 
-                // Checkpoint
-                if ((step+1) % 100 == 0) {
+                // Checkpoint — only save on best loss
+                if ((step+1) % 100 == 0 && last_loss < best_loss) {
+                    best_loss = last_loss;
                     double wall = tb_ms(mach_absolute_time() - t_wall_start);
                     save_checkpoint(CKPT_PATH, step+1, total_steps, lr, last_loss,
                         total_train_ms+cum_train, wall+cum_wall, total_steps_done+cum_steps, adam_t,
                         lw, la, rms_final, &arms_final, embed, &aembed);
+                    printf("  [ckpt saved, best_loss=%.4f]\n", best_loss);
                 }
             }
         }
